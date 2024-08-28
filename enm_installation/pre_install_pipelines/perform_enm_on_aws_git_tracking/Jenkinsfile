@@ -1,0 +1,130 @@
+pipeline {
+    agent any
+    options {
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '5')
+    }
+    parameters {
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+        string(name: 'GERRIT_USER', defaultValue: 'jnkcinmaas', description: 'Which gerrit user to use when pulling and pushing to and from gerrit.')
+    }
+    stages{
+        stage('Remove any previous builds') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage ('Copy artifacts from prepare_enm_on_aws_images') {
+            steps {
+                script {
+                    copyArtifacts filter: '**/*', fingerprintArtifacts: true, projectName: 'prepare_enm_on_aws_images', selector: lastWithArtifacts()
+                    sh 'echo "$(ls)"'
+                }
+            }
+        }
+        stage ('Copy artifacts from modify_enm_on_aws_helm_charts') {
+            steps {
+                script {
+                    copyArtifacts filter: '**/*', fingerprintArtifacts: true, projectName: 'modify_enm_on_aws_helm_charts', selector: lastWithArtifacts()
+                    sh 'echo "$(ls)"'
+                }
+            }
+        }
+        stage('Git tracking') {
+            steps {
+                sh '''#!/bin/bash
+                echo '### Copy modified files, commit and push to ENMaaS/enm-containerization-poc ###'
+                cd enm-containerization-poc/
+
+                git config user.name "Jenkins_NEMESIS_phase1_ENM_install"
+                git config user.email "PDLNEMESIS@pdl.internal.ericsson.com"
+
+                # phase0 OSS ENM-containerisation-POC tracking
+                #cp -r $WORKSPACE/ENM-containerisation-POC/* $WORKSPACE/enm-containerization-poc/
+
+                #echo ""
+                #git add -A
+                #echo ""
+
+                #echo "### Commit and push delta from OSS/ENM-containerisation-POC to ENMaaS/enm-containerization-poc ###"
+                #git diff --quiet && git diff --staged --quiet || git commit -m "$BUILD_NUMBER"_"$JOB_NAME" -m "$BUILD_URL"
+                #git push origin master
+                #echo ""
+
+
+                # phase1 enm-integration tracking
+                echo "### Checkout to the enm-integration-branch, otherwise create it if it doesn't exist and checkout to it ###"
+                enm_integration_branch="enm_integration_branch"
+                git checkout $enm_integration_branch && git branch --set-upstream-to=origin/$enm_integration_branch && git pull --rebase origin $enm_integration_branch || git checkout -b $enm_integration_branch
+
+                cp -r $WORKSPACE/enm-integration/ $WORKSPACE/enm-containerization-poc/
+
+                # disabled to keep track of ENM-containerisation-POC under enm_integration_branch
+                #rm -rf $(ls -1 $WORKSPACE/enm-containerization-poc | grep -v enm-integration)
+
+                mkdir -p $WORKSPACE/enm-containerization-poc/enm-integration/ENM-containerisation-POC
+                cp -r $WORKSPACE/ENM-containerisation-POC/* $WORKSPACE/enm-containerization-poc/enm-integration/ENM-containerisation-POC
+
+                git add -A
+                echo ""
+
+                echo "### Commit and push delta if any, from enm-integration charts to enm-integration branch for ENMaaS/enm-containerization-poc ###"
+                git diff --quiet && git diff --staged --quiet || git commit -m "fem002_$BUILD_NUMBER"_"$JOB_NAME" -m "$BUILD_URL"
+
+                git push -f origin $enm_integration_branch
+                echo ""
+
+
+                echo "Prepare and push the enm-integration.tgz version as a tag, to help tracking which version was used with install."
+                ENM_INTEGRATION_USED="integration-$(ls $WORKSPACE | grep orig_enm-integration | awk -F "orig_enm-integration-" '{print $2}' | awk -F ".tgz" '{print $1}')"
+
+                if [ ! $(git tag -l "$ENM_INTEGRATION_USED") ]; then
+                    git tag -am "Add $ENM_INTEGRATION_USED tag" $ENM_INTEGRATION_USED
+                fi
+                git push origin $ENM_INTEGRATION_USED
+                echo ""
+
+
+                echo "Prepare and push the enm-integration-values version as a tag, to help tracking which version was used with install."
+                ENM_INTEGRATION_VALUES_USED="values-$(ls $WORKSPACE | grep orig_integration-values | awk -F "orig_integration-values-" '{print $2}' | awk -F ".yaml" '{print $1}')"
+
+                if [ ! $(git tag -l "$ENM_INTEGRATION_VALUES_USED") ]; then
+                    git tag -am "Add $ENM_INTEGRATION_VALUES_USED tag" $ENM_INTEGRATION_VALUES_USED
+                fi
+                git push origin $ENM_INTEGRATION_VALUES_USED
+                echo ""
+
+
+                echo "Prepare and push the build number as a tag to the enm-integration branch."
+                BUILD_AS_TAG="build-1.0.$BUILD_NUMBER"
+                if [ ! $(git tag -l "$BUILD_AS_TAG") ]; then
+                    git tag -am "Add $BUILD_AS_TAG tag" $BUILD_AS_TAG
+                fi
+                git push origin $BUILD_AS_TAG
+                echo ""
+
+                cd $WORKSPACE
+                #rm -rf enm-containerization-poc
+                echo ""
+                '''
+            }
+        }
+    }
+    post {
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        /* clean up our workspace */
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

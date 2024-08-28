@@ -1,0 +1,112 @@
+pipeline {
+    agent any
+
+    environment {
+        S3_BUCKET_NAME = "phase0-enm-installation-isos"
+        MOUNT_ISO_FOLDER = "/mnt/iso/"
+        ENM_REPODATA = "/enm_repodata"
+    }
+
+    parameters {
+        string(name: 'ENM_ISO_NUMBER', defaultValue: 'CXP9027091', description: 'Iso number for ENM package')
+        string(name: 'RHEL_PATCHES_ISO_NUMBER', defaultValue: 'CXP9034997', description: 'Iso number for Rhel package')
+        string(name: 'MOUNT_IMAGE', defaultValue: 'armdocker.rnd.ericsson.se/proj-nmaas-pub/enm/prepare-repo:latest')
+        string(name: 'JOB_CONTAINER', defaultValue: 'nemesis_enm_repo_$BUILD_NUMBER')
+    }
+
+    stages{
+        stage('Prepare ENM RPMS Repo') {
+            steps {
+                script {
+                    echo "########Get lastest ENM drop########"
+                    echo "Get version of the product set from rest call"
+                    product_set = sh ( script: "wget -q -O - --no-check-certificate \"https://cifwk-oss.lmera.ericsson.se/getLastGoodProductSetVersion/?productSet=ENM\"", returnStdout: true ).trim()
+                    def (param1, param2) = product_set.tokenize('.')
+                    product_drop = param1 + '.' + param2
+
+                    echo "Product Set: " + product_set
+                    echo "Product Drop: " + product_drop
+
+                    echo "########Getting artifacts from ENM drop as Json file########"
+                    sh ( script: "curl https://cifwk-oss.lmera.ericsson.se/api/getProductSetDropData/productSet/ENM/drop/${product_drop}/?format=json -o output.json", returnStdout: true ).trim()
+
+                    echo "########Executing parser script to get ENM and Rhel Iso file name########"
+                    def parsed_values = sh (script: "python /home/jenkins-nemesis/enm_prepare_rpms_repo/parser.py output.json ${params.ENM_ISO_NUMBER} ${params.RHEL_PATCHES_ISO_NUMBER}", returnStdout: true).trim().split()
+                    url1 = parsed_values[0]
+                    url2 = parsed_values[1]
+                    enm_iso_filename = parsed_values[2]
+                    rhel_patch_filename = parsed_values[3]
+
+                    echo "########Downloading ENM and RHEL Patches########"
+                    sh (script: "echo $url1 $url2 | xargs -n 1 -P 8 wget -nv", returnStdout: true).trim()
+                }
+                sh "ls -l"
+            }
+        }
+
+        stage('Mount and Sync Packages') {
+            steps {
+                script {
+                    echo "########Mounting ${rhel_patch_filename} to ${env.MOUNT_ISO_FOLDER} folder and sync packages to S3########"
+                    sh ( script: "docker pull ${params.MOUNT_IMAGE}", returnStdout: true).trim()
+                    sh ( script: "docker run --privileged -t -d --rm -v /home/jenkins-nemesis/.aws:/root/.aws --name ${params.JOB_CONTAINER} ${params.MOUNT_IMAGE}", returnStdout: true).trim()
+                    def s3_bucket_path = "s3://${env.S3_BUCKET_NAME}"
+                    mountPatchAndSyncWithS3(rhel_patch_filename, s3_bucket_path)
+
+                    echo "########Unmounting ${rhel_patch_filename} from ${env.MOUNT_ISO_FOLDER} folder########"
+                    unmountAndCleanupFile(rhel_patch_filename)
+                }
+                script {
+                    echo "########Mounting ${enm_iso_filename} to ${env.MOUNT_ISO_FOLDER} folder and sync with S3########"
+                    def s3_bucket_path = "s3://${env.S3_BUCKET_NAME}/ENM"
+                    mountPatchAndSyncWithS3(enm_iso_filename, s3_bucket_path)
+
+                    echo "Creating repo-data for ENM Packages and sync to S3"
+                    createRepoDataAndSyncWithS3()
+
+                    echo "########Unmounting ${enm_iso_filename} from ${env.MOUNT_ISO_FOLDER}########"
+                    unmountAndCleanupFile(enm_iso_filename)
+                }
+            }
+        }
+
+        stage('Container Cleanup') {
+            steps {
+                sh """
+                docker stop ${params.JOB_CONTAINER}
+                """
+            }
+        }
+    }
+
+    post {
+        cleanup {
+            /* clean up our workspace */
+            deleteDir()
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+    }
+}
+
+def mountPatchAndSyncWithS3(filename, s3_path) {
+    sh ( script: "docker cp ${filename} ${params.JOB_CONTAINER}:./", returnStdout: true).trim()
+    sh ( script: "docker exec ${params.JOB_CONTAINER} mount -o loop,ro ${filename} ${env.MOUNT_ISO_FOLDER}", returnStdout: true).trim()
+    sh ( script: "docker exec ${params.JOB_CONTAINER} aws s3 sync ${env.MOUNT_ISO_FOLDER} ${s3_path}", returnStdout: true).trim()
+}
+
+def createRepoDataAndSyncWithS3() {
+    sh (script: "docker exec ${params.JOB_CONTAINER} createrepo --outputdir=${env.ENM_REPODATA} ${env.MOUNT_ISO_FOLDER}", returnStdout: true).trim()
+    sh (script: "docker exec ${params.JOB_CONTAINER} aws s3 rm s3://${env.S3_BUCKET_NAME}/ENM/repodata --recursive", returnStdout: true).trim()
+    sh (script: "docker exec ${params.JOB_CONTAINER} aws s3 sync ${env.ENM_REPODATA} s3://${env.S3_BUCKET_NAME}/ENM", returnStdout: true).trim()
+}
+
+def unmountAndCleanupFile(filename) {
+    sh (script: "docker exec ${params.JOB_CONTAINER} bash -c \"umount ${env.MOUNT_ISO_FOLDER} && rm -rf ${filename}\"", returnStdout: true).trim()
+}

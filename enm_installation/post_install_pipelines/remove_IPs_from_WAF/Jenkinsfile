@@ -1,0 +1,129 @@
+def PrepareChangeToken()
+{
+    change_token= sh ( script: "aws waf get-change-token --output text", returnStdout: true ).trim()
+    return change_token
+}
+
+pipeline {
+    agent any
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '7', artifactNumToKeepStr: '10'))
+    }
+    parameters {
+        string(name: 'JENKINS_IP_SET_ID', defaultValue: '7bd9d64c-b66a-4e9c-9f9c-dcdf9b1f16cf', description: 'WAF IP set for jenkins slave IP.')
+        string(name: 'EC2_IP_SET_ID', defaultValue: '016888d2-ac73-43b7-aad9-e96719d1b601', description: 'WAF IP set for EC2 IPs.')
+
+        string(name: 'REGION', defaultValue: 'eu-west-1', description: '')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages {
+        stage('Prepare update_jenkins_ip_set.json') {
+            steps {
+                script{
+                    PrepareChangeToken()
+                    num_addrs = sh ( script: "aws waf get-ip-set --ip-set-id \"${JENKINS_IP_SET_ID}\" --region ${REGION} | grep \"Value\" | awk '{print \$2}' | tr -d '\"'| wc -l", returnStdout: true ).trim().toInteger()
+                    ip_address = sh ( script: "aws waf get-ip-set --ip-set-id \"${JENKINS_IP_SET_ID}\" --region ${REGION} | grep \"Value\" | awk '{print \$2}' | tr -d ','", returnStdout: true ).trim().split()
+
+                    index = 0
+                    update_jenkins_ip_set = "["
+                    for(jenkins_slave_ip in ip_address)
+                    {
+                        index++
+                        update_jenkins_ip_set += """
+                           {
+                           \"Action\": \"DELETE\",
+                           \"IPSetDescriptor\":
+                               {
+                               \"Type\": \"IPV4\",
+                               \"Value\": ${jenkins_slave_ip}
+                               }
+                            }
+                        """
+                        if(index != num_addrs)
+                        {
+                            update_jenkins_ip_set += ","
+                        }
+                    }
+                    update_jenkins_ip_set += "\n]"
+
+					writeFile file: 'update_jenkins_ip_set.json', text: update_jenkins_ip_set.trim()
+                    sh "cat update_jenkins_ip_set.json"
+                }
+            }
+        }
+        stage('Update the jenkins IP set using json file') {
+            steps {
+                script{
+                    if (num_addrs != 0)
+                    {
+                        echo "update jenkins IP set using json file"
+                        sh "aws waf update-ip-set --ip-set-id \"${JENKINS_IP_SET_ID}\" --change-token ${change_token} --updates file://update_jenkins_ip_set.json --region ${REGION}"
+                    }
+                    else
+                    {
+                        echo "No IPs found on WAF jenkins IP set, nothing to delete."
+                    }
+                }
+            }
+        }
+        stage('Prepare update_ec2_ip_set.json') {
+            steps {
+                script{
+                    PrepareChangeToken()
+
+                    num_addrs = sh ( script: "aws waf get-ip-set --ip-set-id \"${EC2_IP_SET_ID}\" --region ${REGION} | grep \"Value\" | awk '{print \$2}' | tr -d '\"' | wc -l", returnStdout: true ).trim().toInteger()
+                    ip_address = sh ( script: "aws waf get-ip-set --ip-set-id \"${EC2_IP_SET_ID}\" --region ${REGION} | grep \"Value\" | awk '{print \$2}' | tr -d ','", returnStdout: true ).trim().split()
+
+                    update_ec2_ip_set = "["
+                    index=0
+                    for(ec2_ip in ip_address)
+                    {
+                        index++
+                        update_ec2_ip_set += """
+                           {
+                           \"Action\": \"DELETE\",
+                           \"IPSetDescriptor\":
+                               {
+                               \"Type\": \"IPV4\",
+                               \"Value\": ${ec2_ip}
+                               }
+                            }
+                        """
+
+                        if(index != num_addrs)
+                        {
+                            update_ec2_ip_set += " ,"
+                        }
+
+                    }
+                    update_ec2_ip_set += "\n]"
+
+                    writeFile file: 'update_ec2_ip_set.json', text: update_ec2_ip_set.trim()
+                    sh "cat update_ec2_ip_set.json"
+                }
+            }
+        }
+        stage('Update the EC2 IP set using json file') {
+            steps {
+                script{
+                    if(num_addrs != 0)
+                    {
+                        echo "update EC2 IP set using json file"
+                        sh "aws waf update-ip-set --ip-set-id \"${EC2_IP_SET_ID}\" --change-token ${change_token} --updates file://update_ec2_ip_set.json --region ${REGION}"
+                    }
+                    else{
+                        echo "No IPs found on WAF EC2 IP set, nothing to delete."
+                    }
+                }
+            }
+        }
+    }
+    post{
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

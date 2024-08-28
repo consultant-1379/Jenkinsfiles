@@ -1,0 +1,194 @@
+pipeline {
+    agent any
+    options {
+        copyArtifactPermission('uninstall_ENM_AWS, smoke_tests_ENM_install, create_AWS_ENM_UI_domain')
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '2', daysToKeepStr: '', numToKeepStr: '5')
+    }
+    parameters {
+        string(name: 'PUBLIC_CLOUD_INTERFACE_IMAGE', defaultValue: 'armdocker.rnd.ericsson.se/proj-nmaas-pub/prod/public-cloud-interface:latest', description: 'Which public-cloud-interface image to pull and use')
+        string(name: 'PUBLIC_CLOUD_INTERFACE_CONTAINER', defaultValue: 'pci_phase1_enm_install_$BUILD_NUMBER', description: 'public clound interface container')
+        string(name: 'EXEC_ON_CONTAINER', defaultValue: 'docker exec $PUBLIC_CLOUD_INTERFACE_CONTAINER', description: 'execute on a running container')
+
+        string(name: 'EKS_CLUSTER_NAME', defaultValue: 'enm-phase-1-enmaws-cluster', description: 'eks cluster name needed to get the config for kubectl, in order to be able to connect to it, this value should be known and provided beforehand')
+        string(name: 'EFS_NAME', defaultValue: 'enm-phase-1-enmaws-efs', description: 'efs  name')
+        string(name: 'NAMESPACE', defaultValue: 'enmaws', description: 'namespace for enm and graphdb cleanup, install and destroy')
+        string(name: 'REGION', defaultValue: "eu-west-1",description: 'AWS region')
+
+        string(name: 'ENM_INSTALL_TIMEOUT', defaultValue: '43200', description: 'ENM install timeout in seconds')
+
+        string(name: 'INTEGRATION_VALUES_VERSION', defaultValue: '1.0.80', description: 'Version of the successful integration values file, to download and use with helm install')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages{
+        stage('Remove any previous builds') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Docker login and ECR token refresh') {
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'nemesis_functional_id', usernameVariable: 'ARMDOCKER_REPO_USER', passwordVariable: 'ARMDOCKER_PASSWORD']]) {
+                    sh '''
+                    docker login armdocker.rnd.ericsson.se --username $ARMDOCKER_REPO_USER --password $ARMDOCKER_PASSWORD
+                    '''
+                }
+            }
+        }
+        stage ('Copy artifacts from prepare_enm_on_aws_images') {
+            steps {
+                script {
+                    copyArtifacts filter: '**/*', fingerprintArtifacts: true, projectName: 'prepare_enm_on_aws_images', selector: lastWithArtifacts()
+                    sh 'echo "$(ls)"'
+                }
+            }
+        }
+        stage ('Copy artifacts from modify_enm_on_aws_helm_charts') {
+            steps {
+                script {
+                    copyArtifacts filter: '*.tgz,*.yaml,enm-integration/**/*', fingerprintArtifacts: true, projectName: 'modify_enm_on_aws_helm_charts', selector: lastWithArtifacts()
+                    sh 'echo "$(ls)"'
+                }
+            }
+        }
+        stage('Prepare and run PCI container') {
+            steps {
+                sh """
+                #!/bin/bash
+                docker images
+                docker ps
+                echo ""
+
+                echo "Run a detached public-cloud-interface container"
+                docker pull $PUBLIC_CLOUD_INTERFACE_IMAGE
+
+                docker run -d -it \
+                -e EFS_NAME="$EFS_NAME" -e NAMESPACE="$NAMESPACE" \
+                -v $WORKSPACE:/tmp/enm_poc \
+                -v /home/jenkins-nemesis/.aws:/root/.aws \
+                --name $PUBLIC_CLOUD_INTERFACE_CONTAINER $PUBLIC_CLOUD_INTERFACE_IMAGE /bin/bash
+
+                $EXEC_ON_CONTAINER ls /tmp/enm_poc/ENM-containerisation-POC
+                $EXEC_ON_CONTAINER ls -a /root/.kube
+                $EXEC_ON_CONTAINER aws eks --region $REGION update-kubeconfig --name $EKS_CLUSTER_NAME
+                sleep 2
+
+                $EXEC_ON_CONTAINER ls -a /root/.kube
+                """
+            }
+        }
+        stage('Pre install statuses') {
+            steps {
+                sh """#!/bin/bash
+                echo "kubectl version:"
+                $EXEC_ON_CONTAINER kubectl version
+                echo ""
+
+                echo "helm version:"
+                $EXEC_ON_CONTAINER helm version
+                echo ""
+
+                echo "hydra version:"
+                $EXEC_ON_CONTAINER hydra --version
+                echo ""
+
+                echo "terraform version:"
+                $EXEC_ON_CONTAINER terraform version
+                echo ""
+
+                echo "Show which AWS account will be used for deploying"
+                $EXEC_ON_CONTAINER aws sts get-caller-identity
+                echo ""
+
+                echo "Show all helm releases across all namespaces"
+                $EXEC_ON_CONTAINER helm ls -a
+                echo ""
+
+                echo "Show all persistent volume claims for the specific namespace"
+                $EXEC_ON_CONTAINER kubectl get pvc --namespace "$NAMESPACE"
+                echo ""
+
+                echo "Show pods for the specific namespace"
+                $EXEC_ON_CONTAINER kubectl get pods --namespace "$NAMESPACE"
+                echo ""
+
+                echo "Show storage classes"
+                $EXEC_ON_CONTAINER kubectl get sc
+                echo ""
+                """
+            }
+        }
+        stage('Install ENM') {
+            steps {
+                sh"""#!/bin/bash
+                ls $WORKSPACE | grep orig
+
+                $EXEC_ON_CONTAINER helm upgrade --install installation-"$NAMESPACE" \
+                --values /tmp/enm_poc/enm-integration/integration-values-"$INTEGRATION_VALUES_VERSION".yaml /tmp/enm_poc/enm-integration.tgz \
+                --namespace "$NAMESPACE" \
+                --wait --timeout "$ENM_INSTALL_TIMEOUT"
+
+                echo ""
+                """
+            }
+        }
+        stage('Check ENM install status') {
+            steps {
+                sh '''#!/bin/bash
+
+                docker exec $PUBLIC_CLOUD_INTERFACE_CONTAINER helm ls "$NAMESPACE"
+                status=\$(docker exec $PUBLIC_CLOUD_INTERFACE_CONTAINER helm status installation-"$NAMESPACE" | grep STATUS | head -1 | awk '{print \$2}')
+
+                if [ ! -z "$status" -a "$status" != " " ]; then
+                    if [ "$status" == "DEPLOYED" ]; then
+                        echo "installation-$NAMESPACE with status: $status, considered ok."
+                    else
+                        echo "installation-$NAMESPACE with status: $status, considered failed." && echo "exiting with code 1." && exit 1
+                    fi
+                fi
+                '''
+            }
+        }
+        stage("Container and Image cleanup") {
+            steps {
+                sh """
+                docker ps
+                docker images
+                echo ""
+
+                #docker stop $PUBLIC_CLOUD_INTERFACE_CONTAINER
+                #docker rm $PUBLIC_CLOUD_INTERFACE_CONTAINER
+
+                # should not be enabled as long as the job NEMESIS_public_cloud_docker_cleanup handles the docker images cleanup on jenkins slave.
+                #docker rmi -f \$(docker images | grep public-cloud-interface | awk '{print \$3}')
+
+                echo ""
+                docker ps
+                docker images
+                """
+            }
+        }
+    }
+    post {
+        always {
+            // the 'always' block executes before the 'cleanup' block, even if it was placed after it
+            archiveArtifacts artifacts: '**/*', defaultExcludes: false
+        }
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        /* clean up our workspace */
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

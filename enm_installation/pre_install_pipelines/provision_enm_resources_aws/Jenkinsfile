@@ -1,0 +1,154 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'PUBLIC_CLOUD_INTERFACE_IMAGE', defaultValue: 'armdocker.rnd.ericsson.se/proj-nmaas-pub/prod/public-cloud-interface')
+        string(name: 'ENM_PHASE1_PROV_CONTAINER', defaultValue: 'provision_resources_pre_phase1_enm_install', description: 'Container to execute hydra')
+
+        string(name: 'REGION', defaultValue: 'eu-west-1', description: 'Region to provision the resources')
+        string(name: 'NAMESPACE', defaultValue: 'enmaws', description: 'Kubernetes namespace')
+
+        string(name: 'STAGE', defaultValue: 'phase-1', description: 'Stage name')
+        string(name: 'NAME', defaultValue: 'enmaws', description: 'Product name')
+        string(name: 'INSTANCE_TYPE', defaultValue: 'r4.4xlarge', description: 'EC2 instance type')
+        string(name: 'MIN_ENM_EC2_INSTANCE_COUNT', defaultValue: '3', description: 'Minimum number of EC2 instances for ENM')
+        string(name: 'MAX_ENM_EC2_INSTANCE_COUNT', defaultValue: '5', description: 'Maximum number of EC2 instances for ENM')
+
+        string(name: 'PHASE1_ENM_PROV_IMAGE', defaultValue: 'phase-1/enm-provisioning', description: 'Phase1 provisioning image which has the modified input file, to call terraform ops.')
+        string(name: 'TAG', defaultValue: '1.0.${BUILD_NUMBER}')
+
+        string(name: 'ECR_LINK', defaultValue: '152254703525.dkr.ecr.eu-west-1.amazonaws.com')
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+
+    stages {
+        stage('Docker Login') {
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'DOCKER_LOGIN_CREDENTIALS', usernameVariable: 'ARM_USER', passwordVariable: 'ARM_PASS']]) {
+                    sh "docker login armdocker.rnd.ericsson.se --username $ARM_USER --password $ARM_PASS"
+                }
+            }
+        }
+
+        stage('Prepare the container') {
+            steps {
+                script {
+                    echo "### Prepare the container ###"
+
+                    found_status = sh ( script: "( docker ps -a | grep -w $ENM_PHASE1_PROV_CONTAINER )", returnStatus: true )
+                    up_status = sh ( script: "( docker ps -a | grep -w $ENM_PHASE1_PROV_CONTAINER | grep -w Up)", returnStatus: true )
+
+                    if ( found_status != 0 ) {
+                        echo "The container $ENM_PHASE1_PROV_CONTAINER was not found, creating it"
+                        sh "docker run -it -d --name $ENM_PHASE1_PROV_CONTAINER $PUBLIC_CLOUD_INTERFACE_IMAGE"
+                    }
+                    else if ( up_status == 0 ) {
+                        echo "The container $ENM_PHASE1_PROV_CONTAINER is already up and running."
+                    }
+                    else {
+                        echo "Starting the container $ENM_PHASE1_PROV_CONTAINER"
+                        sh "docker start $ENM_PHASE1_PROV_CONTAINER"
+                    }
+                }
+            }
+        }
+
+        stage('Update Input Json File') {
+            steps {
+                script {
+                    current_namespace = returnValFromInputFile("namespace")
+                    current_region = returnValFromInputFile("region")
+                    current_stage = returnValFromInputFile("stage")
+                    current_name = returnValFromInputFile("name")
+                    current_instance_type = returnValFromInputFile("instance_type")
+                    current_min_size = returnValFromInputFile("min_size")
+                    current_max_size = returnValFromInputFile("max_size")
+                    updateInputFile(current_namespace, current_region, current_stage, current_name, current_instance_type, current_min_size, current_max_size)
+
+                    echo "Show modified input file contents"
+                    sh ( script: "docker exec $ENM_PHASE1_PROV_CONTAINER cat input.json | grep -Ev \"aws_access_key|aws_secret_key\"", returnStatus: true )
+                }
+            }
+        }
+
+        stage('Build ENM modified image') {
+            steps {
+                sh """
+                docker commit $ENM_PHASE1_PROV_CONTAINER $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:$TAG
+                docker tag $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:$TAG $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:latest
+                """
+            }
+        }
+
+        stage('Provision Cloud Resources') {
+            steps {
+                sh """
+                docker exec $ENM_PHASE1_PROV_CONTAINER hydra --operation all --input_file input.json
+                """
+            }
+        }
+
+        stage('EKS Integration') {
+            steps {
+                sh """
+                docker exec $ENM_PHASE1_PROV_CONTAINER ansible-playbook /root/integration/enm/enm_aws_integration.yaml -i /root/integration/enm/inventories/production/hosts
+                """
+            }
+        }
+
+        stage('Container Cleanup') {
+            steps {
+                sh """
+                docker stop $ENM_PHASE1_PROV_CONTAINER
+                docker rm $ENM_PHASE1_PROV_CONTAINER
+                """
+            }
+        }
+
+        stage('Push modified image to ECR') {
+            steps {
+                sh """
+                docker push $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:$TAG
+                docker push $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:latest
+                """
+            }
+        }
+
+        stage('Image Cleanup') {
+            steps {
+                sh """
+                docker rmi $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:$TAG $ECR_LINK/$PHASE1_ENM_PROV_IMAGE:latest
+                """
+            }
+        }
+    }
+    post {
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}
+
+def updateInputFile(ns, reg, stage, name, inst_type, min, max) {
+    script {
+        sh """
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"region\": \"${reg}\"/\"region\": \"$REGION\"/g\' input.json
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"namespace\": \"${ns}\"/\"namespace\": \"$NAMESPACE\"/g\' input.json
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"stage\": \"${stage}\"/\"stage\": \"$STAGE\"/g\' input.json
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"name\": \"${name}\"/\"name\": \"$NAME\"/g\' input.json
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"instance_type\": \"${inst_type}\"/\"instance_type\": \"$INSTANCE_TYPE\"/g\' input.json
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"min_size\": ${min}/\"min_size\": $MIN_ENM_EC2_INSTANCE_COUNT/g\' input.json
+        docker exec $ENM_PHASE1_PROV_CONTAINER sed -i \'s/\"max_size\": ${max}/\"max_size\": $MAX_ENM_EC2_INSTANCE_COUNT/g\' input.json
+        """
+    }
+}
+
+def returnValFromInputFile(key) {
+    script {
+        value = sh ( script: "docker exec $ENM_PHASE1_PROV_CONTAINER cat input.json | jq -r \'.${key}\'", returnStdout: true).trim()
+        return value
+    }
+}
+

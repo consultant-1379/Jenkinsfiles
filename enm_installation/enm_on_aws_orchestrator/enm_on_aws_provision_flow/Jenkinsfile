@@ -1,0 +1,208 @@
+pipeline {
+    agent any
+    options {
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '10')
+    }
+    parameters {
+        string(name: 'STAGE', defaultValue: 'phase-1', description: 'Stage name')
+        string(name: 'NAME', defaultValue: 'enmaws', description: 'Product name')
+        string(name: 'INSTANCE_TYPE', defaultValue: 'r4.4xlarge', description: 'EC2 instance type')
+        string(name: 'MIN_ENM_EC2_INSTANCE_COUNT', defaultValue: '3', description: 'Minimum number of EC2 instances for ENM')
+        string(name: 'MAX_ENM_EC2_INSTANCE_COUNT', defaultValue: '5', description: 'Maximum number of EC2 instances for ENM')
+
+        string(name: 'PHASE1_ENM_PROV_IMAGE', defaultValue: 'phase-1/enm-provisioning', description: 'Phase1 provisioning image which has the modified input file, to call terraform ops.')
+
+        string(name: 'JENKINS_IP_SET_ID', defaultValue: '7bd9d64c-b66a-4e9c-9f9c-dcdf9b1f16cf', description: 'WAF IP set for jenkins slave IP.')
+        string(name: 'EC2_IP_SET_ID', defaultValue: '016888d2-ac73-43b7-aad9-e96719d1b601', description: 'WAF IP set for EC2 IPs.')
+
+        string(name: 'EC2_NAME_PATTERN', defaultValue: '*enm-phase-1-enmaws-workers*', description: 'The name pattern used to match and get the IPs of certain EC2 instances, and then add these IPs to EC2 IP set on WAF.')
+        string(name: 'EC2_IP_NETMASK', defaultValue: '32', description: 'Netmask for EC2 IPs which are being added to EC2 IP set on WAF.')
+
+        string(name: 'EKS_CLUSTER_NAME', defaultValue: 'enm-phase-1-enmaws-cluster', description: 'eks cluster name needed to get the config for kubectl, in order to be able to connect to it, this value should be known and provided beforehand')
+        string(name: 'EFS_NAME', defaultValue: 'enm-phase-1-enmaws-efs', description: 'efs  name')
+        string(name: 'NAMESPACE', defaultValue: 'enmaws', description: 'namespace for enm and graphdb cleanup, install and destroy')
+        string(name: 'REGION', defaultValue: "eu-west-1",description: 'AWS region')
+        string(name: 'ECR_LINK', defaultValue: '152254703525.dkr.ecr.eu-west-1.amazonaws.com', description: 'AWS ECR link')
+        string(name: 'CLOUD_FRONT_DOMAIN', defaultValue: 'd13h60r5ikn7wu.cloudfront.net', description: 'Current cloud front domain name in use to reach enm related repos on S3')
+
+        string(name: 'ENM_DOMAIN_NAME', defaultValue: 'ericssonenm.customers.enmaas.io', description: 'Domain for the ENM UI')
+        string(name: 'ENM_INSTALL_TIMEOUT', defaultValue: '43200', description: 'ENM install timeout in seconds')
+
+        string(name: 'ARM_PROJ_OSS_RELEASES', defaultValue: 'armdocker.rnd.ericsson.se/proj_oss_releases/enm', description: 'Where to pull phase0 images from. if phase1 images pull from oss fails, then it will try to pull from ARM_PROJ_ENM')
+        string(name: 'ARM_PROJ_ENM', defaultValue: 'armdocker.rnd.ericsson.se/proj-enm', description: 'Where to pull phase1 images from.')
+
+        string(name: 'ENM_INTEGRATION_ARM_URL', defaultValue: 'https://arm.epk.ericsson.se/artifactory/proj-enm-helm/enm-integration/', description: 'Link where the enm-integration charts are stored')
+        booleanParam(name: 'DOWNLOAD_LATEST_ENM_INTEGRATION_TAR', defaultValue: false, description: 'Whether to download the latest enm-integration or a certain version')
+        string(name: 'ENM_INTEGRATION_VERSION', defaultValue: '1.0.40', description: 'Provide the latest successful version for enm-integration-<version>.tgz. the status is listed on daily basis, for now on a confluence page: https://confluence-oss.seli.wh.rnd.internal.ericsson.com/pages/viewpage.action?spaceKey=ECN&title=Daily+Cloud+Native+ENM+Build+and+Test+Status')
+
+        string(name: 'ENM_INTEGRATION_YAML_URL', defaultValue: 'https://arm.epk.ericsson.se/artifactory/proj-enm-helm/integration-values/', description: 'Where all the integration values yaml files.')
+        booleanParam(name: 'DOWNLOAD_LATEST_ENM_INTEGRATION_VALUES', defaultValue: false, description: 'Whether to download the latest enm-integration-values.yaml or a certain version')
+        string(name: 'INTEGRATION_VALUES_VERSION', defaultValue: '1.0.80', description: 'Version of the successful integration values file, to download and use with helm install')
+
+
+        string(name: 'PHASE0_IMAGES_TO_BUILD', defaultValue: 'rhel6base rhel6jboss import-export-service neo4j opendj', description: 'The selected phase0 images from OSS ENM-conternarization-poc that require a build and push to ECR. The values must be space separated.')
+
+        string(name: 'PHASE0_NEO4J_BUILD_EXCLUDED_IMAGES', defaultValue: 'neo4j-extension-plugin neo4j-dps-initclient', description: 'The selected neo4j phase0 images that must be excluded from the phase0 images build. The values must be space separated.')
+
+        string(name: 'PHASE0_IMAGES_TO_PULL', defaultValue: 'ha-proxy httpd openidm sso modelserv postgres', description: 'The seleced phase0 images that require pull, yum repo files modifications, tagging and pushing to ECR. The values must be space separated.')
+
+        string(name: 'INFRA_INTEGRATION_AS_PHASE1_IMAGES', defaultValue: 'serviceregistry sentinel jmsserver gossiprouter-cache gossiprouter-remoting', description: 'The seleced images from infra-integration charts under enm-integration, that should be treated as phase1 images, which will be just pulled, tagged and pushed to ECR. The values must be space separated.')
+
+        string(name: 'RHEL_VERSION', defaultValue: '2.5.1', description: 'RHEL version for the yum rhel.repo of phase0 images, pull stage.')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+
+        string(name: 'GERRIT_USER', defaultValue: 'jnkcinmaas', description: 'Which gerrit user to use when pulling and pushing to and from gerrit.')
+    }
+    stages{
+    stage ("Provision ENM resources on AWS") {
+            steps {
+                build job: 'ENM_install_provision_AWS_resources', parameters: [
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'STAGE', value: STAGE],
+                    [$class: 'StringParameterValue', name: 'NAME', value: NAME],
+                    [$class: 'StringParameterValue', name: 'INSTANCE_TYPE', value: INSTANCE_TYPE],
+                    [$class: 'StringParameterValue', name: 'MIN_ENM_EC2_INSTANCE_COUNT', value: MIN_ENM_EC2_INSTANCE_COUNT],
+                    [$class: 'StringParameterValue', name: 'MAX_ENM_EC2_INSTANCE_COUNT', value: MAX_ENM_EC2_INSTANCE_COUNT],
+
+                    [$class: 'StringParameterValue', name: 'PHASE1_ENM_PROV_IMAGE', value: PHASE1_ENM_PROV_IMAGE],
+                    [$class: 'StringParameterValue', name: 'ECR_LINK', value: ECR_LINK],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Add IPs to WAF") {
+            steps {
+                build job: 'ENM_install_add_IPs_to_AWS_WAF_IP_sets', parameters: [
+                    [$class: 'StringParameterValue', name: 'JENKINS_IP_SET_ID', value: JENKINS_IP_SET_ID],
+                    [$class: 'StringParameterValue', name: 'EC2_IP_SET_ID', value: EC2_IP_SET_ID],
+
+                    [$class: 'StringParameterValue', name: 'EC2_NAME_PATTERN', value: EC2_NAME_PATTERN],
+                    [$class: 'StringParameterValue', name: 'EC2_IP_NETMASK', value: EC2_IP_NETMASK],
+
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Prepare docker images for ENM on AWS") {
+            steps {
+                build job: 'prepare_enm_on_aws_images', parameters: [
+                    [$class: 'StringParameterValue', name: 'ECR_LINK', value: ECR_LINK],
+                    [$class: 'StringParameterValue', name: 'CLOUD_FRONT_DOMAIN', value: CLOUD_FRONT_DOMAIN],
+
+                    [$class: 'StringParameterValue', name: 'ARM_PROJ_OSS_RELEASES', value: ARM_PROJ_OSS_RELEASES],
+                    [$class: 'StringParameterValue', name: 'ARM_PROJ_ENM', value: ARM_PROJ_ENM],
+
+                    [$class: 'StringParameterValue', name: 'ENM_INTEGRATION_ARM_URL', value: ENM_INTEGRATION_ARM_URL],
+                    [$class: 'BooleanParameterValue', name: 'DOWNLOAD_LATEST_ENM_INTEGRATION_TAR', value: DOWNLOAD_LATEST_ENM_INTEGRATION_TAR],
+                    [$class: 'StringParameterValue', name: 'ENM_INTEGRATION_VERSION', value: ENM_INTEGRATION_VERSION],
+
+                    [$class: 'StringParameterValue', name: 'PHASE0_IMAGES_TO_BUILD', value: PHASE0_IMAGES_TO_BUILD],
+                    [$class: 'StringParameterValue', name: 'PHASE0_NEO4J_BUILD_EXCLUDED_IMAGES', value: PHASE0_NEO4J_BUILD_EXCLUDED_IMAGES],
+                    [$class: 'StringParameterValue', name: 'PHASE0_IMAGES_TO_PULL', value: PHASE0_IMAGES_TO_PULL],
+                    [$class: 'StringParameterValue', name: 'INFRA_INTEGRATION_AS_PHASE1_IMAGES', value: INFRA_INTEGRATION_AS_PHASE1_IMAGES],
+
+                    [$class: 'StringParameterValue', name: 'RHEL_VERSION', value: RHEL_VERSION],
+
+                    [$class: 'StringParameterValue', name: 'GERRIT_USER', value: GERRIT_USER],
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Modify and prepare helm charts for ENM on AWS") {
+            steps {
+                build job: 'modify_enm_on_aws_helm_charts', parameters: [
+                    [$class: 'StringParameterValue', name: 'EFS_NAME', value: EFS_NAME],
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'ECR_LINK', value: ECR_LINK],
+
+                    [$class: 'StringParameterValue', name: 'ENM_INTEGRATION_YAML_URL', value: ENM_INTEGRATION_YAML_URL],
+                    [$class: 'BooleanParameterValue', name: 'DOWNLOAD_LATEST_ENM_INTEGRATION_VALUES', value: DOWNLOAD_LATEST_ENM_INTEGRATION_VALUES],
+                    [$class: 'StringParameterValue', name: 'INTEGRATION_VALUES_VERSION', value: INTEGRATION_VALUES_VERSION],
+
+                    [$class: 'StringParameterValue', name: 'ENM_DOMAIN_NAME', value: ENM_DOMAIN_NAME],
+
+                    [$class: 'StringParameterValue', name: 'GERRIT_USER', value: GERRIT_USER],
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Perform git tracking of ENM on AWS") {
+            steps {
+                build job: 'perform_enm_on_aws_git_tracking', parameters: [
+                    [$class: 'StringParameterValue', name: 'GERRIT_USER', value: GERRIT_USER],
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Perform pre install cleanup") {
+            steps {
+                build job: 'uninstall_ENM_AWS', parameters: [
+                    [$class: 'StringParameterValue', name: 'EKS_CLUSTER_NAME', value: EKS_CLUSTER_NAME],
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Install ENM on AWS") {
+            steps {
+                build job: 'install_ENM_AWS', parameters: [
+                    [$class: 'StringParameterValue', name: 'EKS_CLUSTER_NAME', value: EKS_CLUSTER_NAME],
+                    [$class: 'StringParameterValue', name: 'EFS_NAME', value: EFS_NAME],
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'ENM_INSTALL_TIMEOUT', value: ENM_INSTALL_TIMEOUT],
+                    [$class: 'StringParameterValue', name: 'INTEGRATION_VALUES_VERSION', value: INTEGRATION_VALUES_VERSION],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Run smoke tests") {
+            steps {
+                build job: 'smoke_tests_ENM_install', propagate: false, parameters: [
+                    [$class: 'StringParameterValue', name: 'EKS_CLUSTER_NAME', value: EKS_CLUSTER_NAME],
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Create ENM UI launcher on AWS") {
+            steps {
+                build job: 'create_AWS_ENM_UI_domain', parameters: [
+                    [$class: 'StringParameterValue', name: 'ENM_DOMAIN_NAME', value: ENM_DOMAIN_NAME],
+                    [$class: 'StringParameterValue', name: 'EKS_CLUSTER_NAME', value: EKS_CLUSTER_NAME],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+    }
+    post {
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

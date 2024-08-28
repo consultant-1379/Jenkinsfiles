@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'EKS_CLUSTER_NAME', defaultValue: 'enm-phase-1-enmaws-cluster', description: 'eks cluster name needed to get the config for kubectl, in order to be able to connect to it, this value should be known and provided beforehand')
+        string(name: 'REGION', defaultValue: 'eu-west-1', description: '')
+        string(name: 'NAMESPACE', defaultValue: 'enmaws', description: 'namespace for enm and graphdb cleanup, install and destroy')
+
+        string(name: 'PUBLIC_CLOUD_INTERFACE_IMAGE', defaultValue: 'armdocker.rnd.ericsson.se/proj-nmaas-pub/prod/public-cloud-interface:latest', description: 'Which public-cloud-interface image to pull and use')
+        string(name: 'PUBLIC_CLOUD_INTERFACE_CONTAINER', defaultValue: 'pci_uninstall_enm_$BUILD_NUMBER', description: 'public clound interface container')
+        string(name: 'EXEC_ON_CONTAINER', defaultValue: 'docker exec $PUBLIC_CLOUD_INTERFACE_CONTAINER', description: 'execute on a running container')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages {
+        stage('Prepare pre and post enm install cleanup script') {
+            steps {
+                sh '''
+                #!/bin/bash
+                rm -rf install_cleanup.sh
+
+                cat<<-'EOF' > install_cleanup.sh
+                #!/bin/bash
+                echo "pvc cleanup."
+
+                # delete in backgound
+                for i in $(kubectl get pvc --namespace ${NAMESPACE} | egrep 'pv-eric|datadir' | awk '{print $1}');
+                    do kubectl delete pvc $i --namespace ${NAMESPACE} &
+                done
+
+                # while delete is running in backgound, patch finalizers in case if any pvc is hanging in "terminating" state it will resolve that.
+                for j in $(kubectl get pvc --namespace ${NAMESPACE} | egrep 'pv-eric|datadir' | awk '{print $1}');
+                    do kubectl patch pvc $j -p '{"metadata":{"finalizers":null}}' --namespace ${NAMESPACE}
+                done
+
+                echo ""
+
+                echo "enm installation cleanup."
+                helm delete --purge installation-${NAMESPACE}
+                echo ""
+
+                echo "enm installation job cleanup."
+                kubectl delete job installation-${NAMESPACE}
+                echo ""
+
+                # Try to clean up the auxiliary installation pod, which is usually created after all pods are ready.
+                echo "try to cleanup installation pod."
+
+                installation_pod="$(kubectl get pods --namespace ${NAMESPACE} | grep "installation-${NAMESPACE}" | awk '{print $1}')"
+                if [ ! -z "$installation_pod" -a "$installation_pod" != " " ]; then
+                    kubectl delete pod $installation_pod --namespace ${NAMESPACE}
+                fi
+
+                num_terminating_pods="$(kubectl get pods -n $NAMESPACE | grep Terminating | wc -l)"
+                while [[ $num_terminating_pods != "0" ]]
+                do
+                    echo "$num_terminating_pods pods still terminating, waiting for another 5 seconds."
+                    sleep 5
+                    num_terminating_pods=$(kubectl get pods -n $NAMESPACE | grep Terminating | wc -l)
+                done
+
+
+                echo ""
+
+                echo "All install_cleanup.sh commands were executed."
+				EOF
+				# remove the 4 leading tabs
+				sed -i 's/^[ \\t]\\{16\\}//' install_cleanup.sh
+				chmod ugo+x install_cleanup.sh
+                '''
+            }
+        }
+        stage('Prepare and run PCI container') {
+            steps {
+                sh """
+                echo ""
+
+                echo "Run a detached public-cloud-interface container"
+                docker pull $PUBLIC_CLOUD_INTERFACE_IMAGE
+
+                docker run -d -it \
+                -e NAMESPACE="$NAMESPACE" \
+                -v $WORKSPACE:/tmp/uninstall_enm \
+                -v /home/jenkins-nemesis/.aws:/root/.aws \
+                --name $PUBLIC_CLOUD_INTERFACE_CONTAINER $PUBLIC_CLOUD_INTERFACE_IMAGE /bin/bash
+
+                $EXEC_ON_CONTAINER ls -a /root/.kube
+                $EXEC_ON_CONTAINER aws eks --region $REGION update-kubeconfig --name $EKS_CLUSTER_NAME
+                sleep 2
+
+                $EXEC_ON_CONTAINER ls -a /root/.kube
+                """
+            }
+        }
+        stage('Uninstall ENM') {
+            steps {
+                sh """
+                $EXEC_ON_CONTAINER /tmp/uninstall_enm/install_cleanup.sh
+                """
+            }
+        }
+    }
+    post {
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        success {
+            sh "docker stop $PUBLIC_CLOUD_INTERFACE_CONTAINER"
+            sh "docker rm $PUBLIC_CLOUD_INTERFACE_CONTAINER"
+        }
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

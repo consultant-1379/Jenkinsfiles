@@ -1,0 +1,33 @@
+# Jenkinsfiles repository
+
+Please in order to keep the repositorys tidy let's keep the directories in the follow order:
+
+1 . end_to_end_pipeline
+* Jenkinsfile
+
+2 . ENM_instalation
+* install_pipelines
+    * phase1_install
+        * Jenkinsfile
+    * phase0_install
+	* Jenkinsfile
+ 
+* post_install_pipeline
+    * ENM_domain_Route53
+        * Jenkinsfile
+* pre_install_pipeline
+    * add_IPs_to_WAF 
+        * Jenkinsfile
+    * remove_IPs_from_WAF 
+        * Jenkinsfile 
+        
+
+3 . infra_provisioning 
+
+4 . hydra
+
+
+
+
+
+

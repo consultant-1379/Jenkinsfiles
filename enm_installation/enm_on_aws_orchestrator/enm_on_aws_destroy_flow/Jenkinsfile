@@ -1,0 +1,73 @@
+pipeline {
+    agent any
+    options {
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '10')
+    }
+    parameters {
+        string(name: 'JENKINS_IP_SET_ID', defaultValue: '7bd9d64c-b66a-4e9c-9f9c-dcdf9b1f16cf', description: 'WAF IP set for jenkins slave IP.')
+        string(name: 'EC2_IP_SET_ID', defaultValue: '016888d2-ac73-43b7-aad9-e96719d1b601', description: 'WAF IP set for EC2 IPs.')
+
+        string(name: 'EKS_CLUSTER_NAME', defaultValue: 'enm-phase-1-enmaws-cluster', description: 'eks cluster name needed to get the config for kubectl, in order to be able to connect to it, this value should be known and provided beforehand')
+
+        string(name: 'NAMESPACE', defaultValue: 'enmaws', description: 'namespace for enm and graphdb cleanup, install and destroy')
+        string(name: 'REGION', defaultValue: "eu-west-1",description: 'AWS region')
+        string(name: 'ECR_LINK', defaultValue: '152254703525.dkr.ecr.eu-west-1.amazonaws.com', description: 'AWS ECR link')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages{
+        stage ("Run cluster cleanup script") {
+            steps {
+                build job: 'uninstall_ENM_AWS', parameters: [
+                    [$class: 'StringParameterValue', name: 'EKS_CLUSTER_NAME', value: EKS_CLUSTER_NAME],
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Destroy ENM resources on AWS") {
+            steps {
+                build job: 'ENM_install_destroy_AWS_resources', parameters: [
+                    [$class: 'StringParameterValue', name: 'ECR_LINK', value: ECR_LINK],
+
+                    [$class: 'StringParameterValue', name: 'EKS_CLUSTER_NAME', value: EKS_CLUSTER_NAME],
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+                    [$class: 'StringParameterValue', name: 'NAMESPACE', value: NAMESPACE],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+        stage ("Remove IPs from WAF") {
+            steps {
+                build job: 'ENM_install_remove_IPs_from_AWS_WAF_IP_sets', parameters: [
+                    [$class: 'StringParameterValue', name: 'JENKINS_IP_SET_ID', value: JENKINS_IP_SET_ID],
+                    [$class: 'StringParameterValue', name: 'EC2_IP_SET_ID', value: EC2_IP_SET_ID],
+
+                    [$class: 'StringParameterValue', name: 'REGION', value: REGION],
+
+                    [$class: 'StringParameterValue', name: 'EMAIL_TO', value: EMAIL_TO]
+                ]
+            }
+        }
+    }
+    post {
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

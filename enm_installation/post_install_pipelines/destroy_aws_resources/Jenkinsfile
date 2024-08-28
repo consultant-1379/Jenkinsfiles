@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+    environment{
+        PHASE1_ENM_PROV_IMAGE = "phase-1/enm-provisioning"
+    }
+    parameters {
+        string(name: 'ENM_PHASE1_RS_DESTROY_CONTAINER', defaultValue: 'destroy_resources_post_phase1_enm_install', description: 'Container used to call hydra')
+        string(name: 'ECR_LINK', defaultValue: '152254703525.dkr.ecr.eu-west-1.amazonaws.com', description: 'Link to the ECR repo')
+
+        string(name: 'EKS_CLUSTER_NAME', defaultValue: 'enm-phase-1-enmaws-cluster')
+        string(name: 'REGION', defaultValue: 'eu-west-1', description: '')
+        string(name: 'NAMESPACE', defaultValue: 'enmaws')
+
+        string(name: 'SERVICE', defaultValue: 'uiservlb')
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages{
+        stage('ECR login') {
+            steps {
+                script {
+                    DOCKER_LOGIN= sh ( script: "aws ecr get-login --no-include-email", returnStdout: true ).trim()
+                    sh "${DOCKER_LOGIN}"
+                }
+           }
+      }
+        stage('Prepare the container and destroy') {
+            steps {
+                echo '### Pull the latest enm-provisioning image from AWS ECR ###'
+                sh "docker pull $ECR_LINK/$PHASE1_ENM_PROV_IMAGE"
+                echo ""
+
+                script {
+                    echo "### Prepare the container ###"
+
+                    found_status = sh ( script: "( docker ps -a | grep -w $ENM_PHASE1_RS_DESTROY_CONTAINER )", returnStatus: true )
+                    up_status = sh ( script: "( docker ps -a | grep -w $ENM_PHASE1_RS_DESTROY_CONTAINER | grep -w Up)", returnStatus: true )
+
+                    if ( found_status != 0 ) {
+                        echo "The container $ENM_PHASE1_RS_DESTROY_CONTAINER was not found, creating it"
+                        sh "docker run -it -d -v /home/jenkins-nemesis/.aws:/root/.aws --name $ENM_PHASE1_RS_DESTROY_CONTAINER $ECR_LINK/$PHASE1_ENM_PROV_IMAGE"
+                    }
+                    else if ( up_status == 0 ) {
+                        echo "The container $ENM_PHASE1_RS_DESTROY_CONTAINER is already up and running."
+                    }
+                    else {
+                        echo "Starting the container $ENM_PHASE1_RS_DESTROY_CONTAINER"
+                        sh "docker start $ENM_PHASE1_RS_DESTROY_CONTAINER"
+                    }
+                }
+
+                script {
+                    echo "### Show input file contents ###"
+                    sh "docker exec $ENM_PHASE1_RS_DESTROY_CONTAINER cat input.json  | grep -Ev \"aws_access_key|aws_secret_key\" "
+                    echo ""
+                }
+
+                sh '''#!/bin/bash
+                ls_cluster_names="$(aws eks list-clusters | tail -n +3 | head -n -2 | tr -d '",' | sed 's/^[[:space:]]*//')"
+
+                for ls_cluster_name in $ls_cluster_names; do
+                    if [[ "$ls_cluster_name" == "$EKS_CLUSTER_NAME" ]]; then
+                        docker exec $ENM_PHASE1_RS_DESTROY_CONTAINER aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME}
+
+                        docker exec $ENM_PHASE1_RS_DESTROY_CONTAINER kubectl get svc ${SERVICE} -n ${NAMESPACE}
+                        ui_svc_status="$(echo $?)"
+                        if [[ "$ui_svc_status" == 0 ]]; then
+                            echo "Deleting the service: ${SERVICE}"
+                            docker exec $ENM_PHASE1_RS_DESTROY_CONTAINER kubectl delete svc ${SERVICE} -n ${NAMESPACE}
+                        fi
+                    fi
+                done
+                '''
+                script {
+                    echo "### Destroy resources ###"
+                    destroy_ec = sh ( script: "(docker exec $ENM_PHASE1_RS_DESTROY_CONTAINER hydra --operation destroy --input_file input.json )", returnStatus: true )
+                    if ( destroy_ec != 0 ) {
+                        echo "Terraform destroy finished with exit code: destroy_ec"
+						sh "exit $destroy_ec"
+						currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+
+        stage('Container cleanup') {
+            steps {
+                script {
+                    echo "Stop and remove the container $ENM_PHASE1_RS_DESTROY_CONTAINER."
+                    sh "docker ps -a"
+                    echo ""
+                    sh "docker stop ${params.ENM_PHASE1_RS_DESTROY_CONTAINER}"
+                    sh "docker rm ${params.ENM_PHASE1_RS_DESTROY_CONTAINER}"
+                    sh "docker ps -a"
+                    echo ""
+                    echo "Remove the $ECR_LINK/$PHASE1_ENM_PROV_IMAGE image."
+                    echo ""
+                    echo ""
+                    sh "docker rmi -f ${ECR_LINK}/${PHASE1_ENM_PROV_IMAGE}"
+                    echo ""
+                }
+            }
+        }
+    }
+    post {
+        cleanup {
+            /* clean up our workspace */
+            deleteDir()
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

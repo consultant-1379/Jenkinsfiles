@@ -1,0 +1,78 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'K8SVER', defaultValue: '1.12', description: 'Kubernetes version')
+    }
+
+    stages {
+        stage('Fetch AMI Name') {
+            steps {
+                script {
+                    fetch_amz_ami ="""
+                    aws ec2 describe-images \\
+                    --filters \"Name=owner-id,Values=602401143452,Name=name,Values=amazon-eks-node-${K8SVER}*\" \\
+                    --query 'sort_by(Images, &CreationDate)[-1].Name' \\
+                    --output text
+                    """
+                    AMZAMI = sh ( script: fetch_amz_ami, returnStdout: true ).trim()
+                }
+            }
+        }
+
+        stage('Fetch Region List') {
+            steps {
+                script {
+                    fetch_region_list = """
+                    aws ec2 describe-regions \\
+                    --query \"Regions[].{Name:RegionName}\" \\
+                    --output text
+                    """
+                    REGION_LIST = sh ( script: fetch_region_list, returnStdout: true ).trim().split()
+                }
+            }
+        }
+
+        stage('Created Encrypted AMI') {
+            steps {
+                script {
+                    for (given_region in REGION_LIST) {
+                        fetch_region_ami = """
+                        aws ec2 --region ${given_region} describe-images \\
+                        --filters \"Name=owner-id,Values=602401143452,Name=name,Values=amazon-eks-node-${K8SVER}*\" \\
+                        --query 'sort_by(Images, &CreationDate)[-1].ImageId' \\
+                        --output text
+                        """
+                        AMZAMIID = sh ( script: fetch_region_ami, returnStdout: true ).trim()
+
+                        fetch_encr_ami = """
+                        aws --region ${given_region} ec2 describe-images \\
+                        --filters \"Name=owner-id,Values=self,Name=name,Values=encrypted-amazon-eks-node-${K8SVER}*\" \\
+                        --query 'sort_by(Images, &CreationDate)[-1].Name' \\
+                        --output text
+                        """
+                        REGAMI = sh ( script: fetch_encr_ami, returnStdout: true ).trim()
+
+                        if (REGAMI == "encrypted-${AMZAMI}") {
+                            echo "We already have encrypted image for K8s version: ${K8SVER} in Region: ${given_region}"
+                        }
+                        else {
+                            echo "Encrypted image for K8s version: ${K8SVER} not found Region: ${given_region}"
+                            echo "Copying Image to region"
+
+                            copy_image = """
+                            aws --region ${given_region} ec2 copy-image \\
+                            --description \"Encrypted AWS EKS worker node\" \\
+                            --encrypted \\
+                            --name encrypted-${AMZAMI} \\
+                            --source-image-id ${AMZAMIID} \\
+                            --source-region ${given_region}
+                            """
+                            sh ( script: copy_image, returnStdout: true ).trim()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

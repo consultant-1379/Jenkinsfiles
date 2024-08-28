@@ -1,0 +1,134 @@
+def PrepareChangeToken()
+{
+    change_token = sh ( script: "aws waf get-change-token --output text ", returnStdout: true ).trim()
+    return change_token
+}
+
+def PrepareUpdateEC2IPSetJsonFile()
+{
+    num_addrs = sh ( script: "aws ec2 describe-instances --filters \"Name=tag:Name,Values=${EC2_NAME_PATTERN}\" --query 'Reservations[*].Instances[*].PublicIpAddress' --output text --region ${REGION} | wc -l ", returnStdout: true ).trim()
+    echo num_addrs
+    index = 0
+    ip_addresses = sh ( script: "aws ec2 describe-instances --filters \"Name=tag:Name,Values=${EC2_NAME_PATTERN}\" --query 'Reservations[*].Instances[*].PublicIpAddress' --output text --region ${REGION}", returnStdout: true ).trim().split()
+
+    update_ec2_ip_set = "["
+    for (ec2_ip in ip_addresses)
+    {
+        index++
+        update_ec2_ip_set += """
+           {
+           \"Action\": \"INSERT\",
+           \"IPSetDescriptor\":
+               {
+               \"Type\": \"IPV4\",
+               \"Value\": \"${ec2_ip}/${EC2_IP_NETMASK}\"
+               }
+        """
+        if (index != num_addrs.toInteger())
+        {
+            update_ec2_ip_set += "  },"
+        }
+        else
+        {
+            update_ec2_ip_set += "  }"
+        }
+        
+    } 
+    update_ec2_ip_set += "\n]"
+    writeFile file: 'update_ec2_ip_set.json', text: update_ec2_ip_set.trim()
+    sh "cat update_ec2_ip_set.json"
+}
+
+pipeline {
+    agent any
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '7', artifactNumToKeepStr: '10'))
+    }
+    parameters {
+        string(name: 'JENKINS_IP_SET_ID', defaultValue: '7bd9d64c-b66a-4e9c-9f9c-dcdf9b1f16cf', description: 'WAF IP set for jenkins slave IP.')
+        string(name: 'EC2_IP_SET_ID', defaultValue: '016888d2-ac73-43b7-aad9-e96719d1b601', description: 'WAF IP set for EC2 IPs.')
+
+        string(name: 'EC2_NAME_PATTERN', defaultValue: '*enm-phase-1-enmaws-workers*', description: 'The name pattern used to match and get the IPs of certain EC2 instances, and then add these IPs to EC2 IP set on WAF.')
+        string(name: 'EC2_IP_NETMASK', defaultValue: '32', description: 'Netmask for EC2 IPs which are being added to EC2 IP set on WAF.')
+
+        string(name: 'REGION', defaultValue: 'eu-west-1', description: '')
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages {
+        stage('Prepare new IP address') {
+            steps {
+                script{
+                    trial_num = 0
+                    newIPAddress = ""
+                    while (newIPAddress == "")
+                    {
+                        trial_num++
+                        echo "trial number: ${trial_num}"
+                        newIPAddress = sh ( script: "curl myip.dnsomatic.com", returnStdout: true ).trim()
+                        echo "IP: ${newIPAddress}"
+                    }
+                    
+                }
+            }
+        }
+        stage('Prepare update_jenkins_ip_set.json') {
+            steps {
+                script{
+                    PrepareChangeToken()
+                    update_jenkins_ip_set = """
+                        [
+                           {
+                           \"Action\": \"INSERT\",
+                           \"IPSetDescriptor\":
+                               {
+                               \"Type\": \"IPV4\",
+                               \"Value\": \"${newIPAddress}/${EC2_IP_NETMASK}\"
+                               }
+                           }
+                        ]
+                    """
+                    writeFile file: 'update_jenkins_ip_set.json', text: update_jenkins_ip_set.trim()
+                    sh "cat update_jenkins_ip_set.json"
+                }
+            }
+        }
+        stage('Update the jenkins slave IP set on WAF') {
+            steps {
+                script{
+                    echo "update jenkins ip set"
+                    sh "aws waf update-ip-set --ip-set-id \"${params.JENKINS_IP_SET_ID}\" --change-token ${change_token} --updates file://update_jenkins_ip_set.json --region ${REGION}"
+                }
+            }
+        }
+        stage('Prepare update_ec2_ip_set.json') {
+            steps {
+                script{
+                    PrepareChangeToken()
+                    PrepareUpdateEC2IPSetJsonFile()
+                }
+            }
+        }
+        stage('Update the EC2 IP set on WAF') {
+            steps {
+                script{
+                    if(num_addrs != 0)
+                    {
+                        sh "aws waf update-ip-set --ip-set-id \"${EC2_IP_SET_ID}\" --change-token ${change_token} --updates file://update_ec2_ip_set.json --region ${REGION}"
+                    }
+                    else{
+                        echo "No EC2 IPs found for the given pattern ${EC2_NAME_PATTERN}"
+                    }
+                }
+            }
+        }
+    }
+    post{
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+    
+}
+

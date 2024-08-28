@@ -1,0 +1,228 @@
+pipeline {
+agent any
+environment{
+    BRANCH_NAME = "master"
+}
+parameters {
+    string(name: 'CONTAINER_NAME', defaultValue: 'NEMESIS_phase1_ENM_smoke_tests_$BUILD_NUMBER', description: 'Container spinned up for task execution')
+    string(name: 'PUBLIC_CLOUD_INTERFACE_IMAGE', defaultValue: 'armdocker.rnd.ericsson.se/proj-nmaas-pub/prod/public-cloud-interface:latest', description: 'PCI Image for container')
+    string(name: 'EXEC_ON_CONTAINER', defaultValue: 'docker exec $CONTAINER_NAME', description: '')
+
+    string(name: 'EKS_CLUSTER_NAME', defaultValue: 'enm-phase-1-enmaws-cluster', description: 'Name of the deployed EKS cluster')
+    string(name: 'REGION', defaultValue: 'eu-west-1', description: '')
+    string(name: 'NAMESPACE', defaultValue: 'enmaws', description: 'Namespace of the ENM cluster')
+
+    string(name: 'DEPLOYMENT_COUNT', defaultValue: '41', description: 'Total expected enm deployments count')
+    string(name: 'RUNNING_ENM_POD_COUNT', defaultValue: '53', description: 'Total Expected Running enm pods after installation')
+    string(name: 'WORKER_NODES_COUNT', defaultValue: '3', description: 'Total expected worker nodes in the cluster')
+
+    string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+    }
+    stages{
+        stage('Remove any previous builds') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage ('Copy artifacts') {
+                steps {
+                    script {
+                        copyArtifacts filter: 'enm-integration/**/*', fingerprintArtifacts: true, projectName: 'install_ENM_AWS', selector: lastWithArtifacts()
+                        sh 'echo "$(ls)"'
+                    }
+                }
+        }
+        stage('ENM Smoke Tests') {
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'nemesis_functional_id', usernameVariable: 'ARMDOCKER_REPO_USER', passwordVariable: 'ARMDOCKER_PASSWORD']]) {
+                    sh '''
+                    docker login armdocker.rnd.ericsson.se --username $ARMDOCKER_REPO_USER --password $ARMDOCKER_PASSWORD
+                    '''
+                }
+
+                    echo '####### PULL LATEST PCI IMAGE #######'
+                    sh '''
+                    docker pull $PUBLIC_CLOUD_INTERFACE_IMAGE
+                    docker run -d -it -v /home/jenkins-nemesis/.aws:/root/.aws --name $CONTAINER_NAME $PUBLIC_CLOUD_INTERFACE_IMAGE
+                    $EXEC_ON_CONTAINER aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $REGION
+                    '''
+                script {
+                    pass = 0
+                    fail = 0
+                    echo '### SMOKE TEST #1: List all worker nodes ###'
+                    echo ""
+                    running_worker_nodes_ready_status = sh ( script: "($EXEC_ON_CONTAINER kubectl get nodes| awk \'{print \$2}\' | grep Ready | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$running_worker_nodes_ready_status" == "$WORKER_NODES_COUNT" ) {
+                        echo "ALL WORKER NODES ARE IN READY STATUS, number of worker nodes in ready status:$running_worker_nodes_ready_status , number of expected worker nodes:$WORKER_NODES_COUNT "
+                        pass = pass + 1
+                    } else {
+                        echo "NOT ALL WORKER NODES ARE IN READY STATUS PLEASE CHECK, number of worker nodes in ready status:$running_worker_nodes_ready_status , number of expected worker nodes:$WORKER_NODES_COUNT "
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+                script {
+                    echo '### SMOKE TEST #2: CHECK IF ALL PODS DEPLOYED ARE RUNNING ###'
+                    echo ""
+                    all_running_pods = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep -v installation-* | grep -E \"1/1|2/2\" | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$all_running_pods" == "$RUNNING_ENM_POD_COUNT" ) {
+                        echo "ALL PODS DEPLOYED ARE IN RUNNING STATE"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                    echo "expected number of running pods: $RUNNING_ENM_POD_COUNT, actual number of running pods: $all_running_pods"
+                }
+
+                script {
+                    echo '### SMOKE TEST #3: VERIFY REPLICA COUNT AND STATUS FOR MODELSERV PODS ###'
+                    echo ""
+                    MODELSERV_FILE = "enm-integration/charts/infra-integration/charts/eric-enmsg-modelserv/values.yaml"
+                    replicas = sh ( script: "(grep -A3 'replicas-eric-enmsg-modelserv:' $MODELSERV_FILE | head -n1| awk \'{print \$2}\')", returnStdout: true ).trim()
+                    echo ""
+                    current_model_pod_count = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep models-* | grep 1/1 | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$current_model_pod_count" == "$replicas" ) {
+                        echo "ALL MODELSERV PODS DEPLOYED SUCCESSFULLY, number of expected modelserv replicas:$replicas, number of modelserv pods running:$current_model_pod_count"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, number of expected modelserv replicas:$replicas, number of modelserv pods running:$current_model_pod_count"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+                script {
+                    echo '### SMOKE TEST #4: VERIFY REPLICA COUNT AND STATUS FOR JMS PODS ###'
+                    echo ""
+                    JMS_VALUES_FILE = "enm-integration/charts/infra-integration/charts/eric-enmsg-jmsserver/values.yaml"
+                    echo ""
+                    replicas = sh ( script: "(grep -A3 'replicas-eric-enmsg-jmsserver:' $JMS_VALUES_FILE | head -n1 | awk \'{print \$2}\')", returnStdout: true ).trim()
+                    echo ""
+                    current_jms_pod_count = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep jms-* | grep 1/1 | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$current_jms_pod_count" == "$replicas" ) {
+                        echo "ALL JMS PODS DEPLOYED SUCCESSFULLY, number of JMS replicas expected:$replicas, number of JMS pods running:$current_jms_pod_count"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, number of JMS replicas expected:$replicas, number of JMS pods running:$current_jms_pod_count"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+
+                script {
+                    echo '### SMOKE TEST #5: CHECK IF NEO4J PODS ARE CREATED SUCCESSFULLY ###'
+                    echo ""
+                    NEO4J_FILE = "enm-integration/charts/infra-integration/charts/neo4j/values.yaml"
+                    core = sh ( script: "(grep -A3 'core:' $NEO4J_FILE | head -n2 | tail -n1| awk \'{print \$2}\')", returnStdout: true ).trim()
+                    echo ""
+                    current_neo4j_pod_count = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep graphdb-neo4j-* | grep 1/1 | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$current_neo4j_pod_count" == "$core" ) {
+                        echo "ALL NEO4J PODS DEPLOYED SUCCESSFULLY, number of NEO4J pods expected:$core, number of NEO4J pods running:$current_neo4j_pod_count"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, some NEO4J pods are not running"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+
+                script {
+                    echo '### SMOKE TEST #6: CHECK IF EFS PROVISIONER POD IS RUNNING ###'
+                    echo ""
+                    efs_pod_name = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep efs | grep 1/1 | cut -d' ' -f1 )", returnStdout: true ).trim()
+                    echo ""
+                    pvc_bound_status = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep efs | grep 1/1 | wc -l )", returnStdout: true ).trim()
+                    echo ""
+                    echo "Name of EFS pod: $efs_pod_name"
+                    echo ""
+                    if ( pvc_bound_status == "1" ) {
+                        echo "EFS POD RUNNING SUCCESSFULLY"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, EFS pod is not running"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }       
+                script {    
+                    echo '### SMOKE TEST #7: CHECK TOTAL RUNNING POD COUNT ###'
+                    echo ""
+                    current_running_pod_count = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep -E \"1/1|2/2\" | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$current_running_pod_count" == "$RUNNING_ENM_POD_COUNT" ) {
+                        echo "POD COUNT VERIFIED SUCCESSFULLY, number of currently running pods:$current_running_pod_count, number of expected pods:$RUNNING_ENM_POD_COUNT"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, running pod count is different than expected"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+                script {
+                    echo '### SMOKE TEST #8: CHECK TOTAL DEPLOYMENT COUNT ###'
+                    echo ""
+                    current_deployment_count = sh ( script: "($EXEC_ON_CONTAINER kubectl get deployments -n $NAMESPACE | grep -Ev \"AGE\" | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$current_deployment_count" == "$DEPLOYMENT_COUNT" ) {
+                        echo "DEPLOYMENT COUNT VERIFIED SUCCESSFULLY, number of current deployments:$current_deployment_count, number of expected deployments:$DEPLOYMENT_COUNT"
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, current deployment count is different than expected"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+                script {
+                    echo '### SMOKE TEST #9: CHECK FOR EVICTED PODS ###'
+                    echo ""
+                    num_evicted_pods = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep Evicted | wc -l)", returnStdout: true ).trim()
+                    echo ""
+                    if ( "$num_evicted_pods" == "0" ) {
+                        echo "SUCCESS, no pods are in evicted state."
+                        pass = pass + 1
+                    } else {
+                        echo "TEST FAILED!, $num_evicted_pods pods are in evicted state."
+                        evicted_pods = sh ( script: "($EXEC_ON_CONTAINER kubectl get pods -n $NAMESPACE | grep Evicted)", returnStdout: true ).trim()
+                        echo "$evicted_pods"
+                        fail = fail + 1
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+                echo "##################### ${pass} test cases passed #####################"
+                echo "##################### ${fail} test cases failed #####################"
+            }
+        }  
+        stage('Container cleanup') {
+            steps {
+                echo '### Stop and remove used container ###'
+                sh "docker ps -a"
+                sh "docker stop ${params.CONTAINER_NAME}"
+                sh "docker rm ${params.CONTAINER_NAME}"
+                sh "docker ps -a"
+            }
+        }
+    }
+    post {
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

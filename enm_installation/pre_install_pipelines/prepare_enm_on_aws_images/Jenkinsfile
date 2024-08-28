@@ -1,0 +1,704 @@
+pipeline {
+    agent any
+    options {
+        copyArtifactPermission('modify_enm_on_aws_helm_charts, perform_enm_on_aws_git_tracking, install_ENM_AWS')
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '2', daysToKeepStr: '', numToKeepStr: '5')
+    }
+    parameters {
+        string(name: 'ECR_LINK', defaultValue: '152254703525.dkr.ecr.eu-west-1.amazonaws.com', description: 'AWS ECR link')
+        string(name: 'CLOUD_FRONT_DOMAIN', defaultValue: 'd13h60r5ikn7wu.cloudfront.net', description: 'Current cloud front domain name in use to reach enm related repos on S3')
+
+        string(name: 'ARM_PROJ_OSS_RELEASES', defaultValue: 'armdocker.rnd.ericsson.se/proj_oss_releases/enm', description: 'Where to pull phase0 images from. if phase1 images pull from oss fails, then it will try to pull from ARM_PROJ_ENM')
+        string(name: 'ARM_PROJ_ENM', defaultValue: 'armdocker.rnd.ericsson.se/proj-enm', description: 'Where to pull phase1 images from.')
+
+        string(name: 'ENM_INTEGRATION_ARM_URL', defaultValue: 'https://arm.epk.ericsson.se/artifactory/proj-enm-helm/enm-integration/', description: 'Link where the enm-integration charts are stored')
+        booleanParam(name: 'DOWNLOAD_LATEST_ENM_INTEGRATION_TAR', defaultValue: false, description: 'Whether to download the latest enm-integration or a certain version')
+        string(name: 'ENM_INTEGRATION_VERSION', defaultValue: '1.0.40', description: 'Provide the latest successful version for enm-integration-<version>.tgz. the status is listed on daily basis, for now on a confluence page: https://confluence-oss.seli.wh.rnd.internal.ericsson.com/pages/viewpage.action?spaceKey=ECN&title=Daily+Cloud+Native+ENM+Build+and+Test+Status')
+
+        string(name: 'PHASE0_IMAGES_TO_BUILD', defaultValue: 'rhel6base rhel6jboss import-export-service neo4j opendj', description: 'The selected phase0 images from OSS ENM-conternarization-poc that require a build and push to ECR. The values must be space separated.')
+
+        string(name: 'PHASE0_NEO4J_BUILD_EXCLUDED_IMAGES', defaultValue: 'neo4j-extension-plugin neo4j-dps-initclient', description: 'The selected neo4j phase0 images that must be excluded from the phase0 images build. The values must be space separated.')
+
+        string(name: 'PHASE0_IMAGES_TO_PULL', defaultValue: 'ha-proxy httpd openidm sso modelserv postgres', description: 'The seleced phase0 images that require pull, yum repo files modifications, tagging and pushing to ECR. The values must be space separated.')
+
+        string(name: 'INFRA_INTEGRATION_AS_PHASE1_IMAGES', defaultValue: 'serviceregistry sentinel jmsserver gossiprouter-cache gossiprouter-remoting', description: 'The seleced images from infra-integration charts under enm-integration, that should be treated as phase1 images, which will be just pulled, tagged and pushed to ECR. The values must be space separated.')
+
+        string(name: 'RHEL_VERSION', defaultValue: '2.5.1', description: 'RHEL version for the yum rhel.repo of phase0 images, pull stage.')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+
+        string(name: 'GERRIT_USER', defaultValue: 'jnkcinmaas', description: 'Which gerrit user to use when pulling and pushing to and from gerrit.')
+    }
+    stages{
+        stage('Remove any previous builds') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Refresh armdocker login') {
+           steps {
+
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'nemesis_functional_id', usernameVariable: 'ARMDOCKER_REPO_USER', passwordVariable: 'ARMDOCKER_PASSWORD']]) {
+                    sh '''
+                    docker login armdocker.rnd.ericsson.se --username $ARMDOCKER_REPO_USER --password $ARMDOCKER_PASSWORD
+                    '''
+                }
+            }
+        }
+        stage('Clone gerrit repos') {
+            steps {
+                sh '''#!/bin/bash
+                echo ""
+                if [ $DOWNLOAD_LATEST_ENM_INTEGRATION_TAR == "false" ]; then
+                    `wget $ENM_INTEGRATION_ARM_URL/enm-integration-${ENM_INTEGRATION_VERSION}.tgz`
+                    SELECTED_TAR="enm-integration-${ENM_INTEGRATION_VERSION}.tgz"
+                else
+					echo '### Parse to find latest enm-integration tarball from artifactory ###'
+					SELECTED_TAR=`curl -s $ENM_INTEGRATION_ARM_URL | grep '.tgz' | grep -Ev "sha|md5" | awk -F " " '{print $2,$3,$4}' | sort  -k2,3 | tail -n 1 | cut -d '"' -f2`
+
+					echo "### The latest enm-integration: $SELECTED_TAR ###"
+					`wget $ENM_INTEGRATION_ARM_URL/$SELECTED_TAR`
+                fi
+
+                echo "### Make a copy of the original enm-integration-<version>.tgz and keep it for debugging purposes ###"
+                cp $SELECTED_TAR orig_$SELECTED_TAR
+                echo ""
+
+                echo "### Extract and remove $SELECTED_TAR ###"
+                tar xf $SELECTED_TAR
+                rm -rf $SELECTED_TAR
+                echo ""
+
+
+                echo '### Clone OSS/ENM-containerisation-POC master ###'
+                git clone ssh://$GERRIT_USER@gerrit.ericsson.se:29418/OSS/com.ericsson.oss.containerisation/ENM-containerisation-POC
+                echo ""
+
+                echo '### Clone ENMaaS/enm-containerization-poc master ###'
+                git clone ssh://$GERRIT_USER@gerrit.ericsson.se:29418/ENMaaS/enm-public-cloud/enm-containerization-poc
+                echo ""
+
+                ls -1
+                echo ""
+
+                echo '### Latest commit on OSS/ENM-containerisation-POC master ###'
+                cd ENM-containerisation-POC/ && git config pager.log false && git log --stat HEAD^..HEAD && cd ..
+                echo ""
+                '''
+            }
+        }
+        stage('Prepare ecr registry lifecycle policy as a json file') {
+            steps{
+                sh '''#!/bin/bash
+                echo "Prepare ecr registry lifecycle policy as a json file."
+                echo '{
+                    "rules":
+                    [{
+                        "rulePriority": 1,
+                        "description": "Keep the latest + 4 images on repository.",
+                        "selection":
+                        {
+                            "countType": "imageCountMoreThan",
+                            "countNumber": 5,
+                            "tagStatus": "any"
+                        },
+                        "action":
+                        {
+                            "type": "expire"
+                        }
+                    }]
+                }'> ecr_registry_lifecycle_policy.json
+                sed -i 's/^[[:space:]]*//' ecr_registry_lifecycle_policy.json
+                '''
+            }
+        }
+         stage('Separate enm-init-container:test image handling') {
+            steps {
+                sh '''#!/bin/bash
+                echo "Separately pull eric-enm-init-container:test from proj_oss_releases/enm"
+                docker pull armdocker.rnd.ericsson.se/proj_oss_releases/enm/eric-enm-init-container:test
+                echo ""
+
+                CLOUD_FRONT_LINK="baseurl=http\\:\\/\\/$CLOUD_FRONT_DOMAIN"
+                echo "$CLOUD_FRONT_LINK"
+                echo ""
+
+
+                echo "Modify rhel.repo and cifwk_enm.repo for eric-enm-init-container:test image to use cloudfront link to reach S3"
+                container_name="enm-init_container_$BUILD_ID"
+                docker run -d -it --name ${container_name} armdocker.rnd.ericsson.se/proj_oss_releases/enm/eric-enm-init-container:test bash
+
+                docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/RHEL6.10_OS_Patch_Set\\/latest/$CLOUD_FRONT_LINK\\/RHEL/g" \\
+                /etc/yum.repos.d/rhel.repo
+
+                docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/ENM\\/latest/$CLOUD_FRONT_LINK\\/ENM/g" \\
+                /etc/yum.repos.d/cifwk_enm.repo
+
+                docker commit ${container_name} $ECR_LINK/enm/eric-enm-init-container:test
+                echo ""
+
+
+                echo "Show rhel.repo and cifwk_enm.repo caontents of eric-enm-init-container:test image"
+                docker run --rm $ECR_LINK/enm/eric-enm-init-container:test cat /etc/yum.repos.d/rhel.repo
+                docker run --rm $ECR_LINK/enm/eric-enm-init-container:test cat /etc/yum.repos.d/cifwk_enm.repo
+                echo ""
+
+                echo "Check and create eric-enm-init-container registry if it does not exist"
+
+                REGISTRIES_ON_ECR=$(aws ecr describe-repositories | grep repositoryName | awk '{print $2}' | tr -d '",')
+                registry_name="enm/eric-enm-init-container"
+                grep -q ${registry_name} <<< "$REGISTRIES_ON_ECR"
+
+                if [[ $? -eq 0 ]]; then
+                    echo "Registry ${registry_name} already exists on ECR."
+                else
+                    echo "$registry_name does not exist on ECR, creating it."
+                    aws ecr create-repository --repository-name ${registry_name}
+                    if [[ ! $? == 0 ]] ; then
+                        echo "Failed to create $registry_name on ECR."
+                        exit 1
+                    fi
+
+                    echo "applying lifecycle policy for $registry_name"
+                    aws ecr put-lifecycle-policy --repository-name "${registry_name}" --lifecycle-policy-text file://ecr_registry_lifecycle_policy.json
+                     if [[ ! $? == 0 ]] ; then
+                        echo "Failed to assign lifecycle policy on ECR for $registry_name"
+                        exit 1
+                    fi
+
+                    echo "Successfully created $registry_name on ECR."
+                fi
+                echo ""
+
+                echo "Push eric-enm-init-container:test to ECR"
+                docker push $ECR_LINK/enm/eric-enm-init-container:test
+                echo ""
+
+                echo "Stop and remove the containers"
+                docker stop ${container_name} && docker rm ${container_name}
+                echo ""
+
+                #echo "Remove the used and created images"
+                docker rmi -f $(docker images | egrep "init" | awk '{print $3}')
+                echo ""
+                '''
+            }
+        }
+        stage('Build, pull and push images') {
+            steps {
+                sh '''#!/bin/bash
+                OSS_PHASE0_PATH="ENM-containerisation-POC/phase-0"
+
+                STATELESS_INTEGRATION_PATH="enm-integration/charts/stateless-integration/charts"
+                INFRA_INTEGRATION_PATH="enm-integration/charts/infra-integration/charts"
+
+                # sed ready cloud front link
+                CLOUD_FRONT_LINK="baseurl=http\\:\\/\\/$CLOUD_FRONT_DOMAIN"
+
+                echo "Step 1. prepare and show phase0 images names to build."
+                fullname_phase0_images_to_build=$(ls ${OSS_PHASE0_PATH} | grep eric | grep -Ev $(sed s"/ /|/g" <<< ${PHASE0_NEO4J_BUILD_EXCLUDED_IMAGES}) | grep -E $(sed s"/ /|/g" <<< ${PHASE0_IMAGES_TO_BUILD}))
+                num_phase0_images_to_build="$(echo "${fullname_phase0_images_to_build}" | wc -l)"
+                echo "number of phase0 images that need to be built: ${num_phase0_images_to_build}"
+                echo ""
+                echo "phase0 images that need to be built:"
+                echo "${fullname_phase0_images_to_build}"
+                echo ""
+
+                echo "Step 2. find charts paths of phase0 pullable images."
+                charts_paths_of_phase0_pullable_imgs=""
+                for phase0_pullable_img_name in ${PHASE0_IMAGES_TO_PULL}; do
+                    # get the path of phase1 repo name, given a partial value provided in the PHASE0_IMAGES_TO_PULL list
+                    chart_path=$(find enm-integration -type d -name eric-enmsg-${phase0_pullable_img_name})
+
+                    # at the beginning of the loop, charts_paths_of_phase0_pullable_imgs variable is still empty, so to avoid having an empty line followed by values
+                    if [[ -z "$charts_paths_of_phase0_pullable_imgs" ]]; then
+                        charts_paths_of_phase0_pullable_imgs="${chart_path}"
+                    else
+                        charts_paths_of_phase0_pullable_imgs="${charts_paths_of_phase0_pullable_imgs}"$'\\n'"${chart_path}"
+                    fi
+                done
+                echo ""
+
+                echo "Step 3. prepare all phase0 images to pull, by reading names and tags from charts."
+                phase0_imgs_names_with_tags_to_pull=""
+                for chart_path in ${charts_paths_of_phase0_pullable_imgs}; do
+                    values_file="$chart_path/values.yaml"
+                    values_file_imgs=$(sed -n '/images/,/imageCredentials/p' ${values_file} | grep -E "name: eric|tag" | sed 's/name: //g' | sed 's/tag: //g' | awk '{$1=$1};1' | sed 's/\\r//g' | xargs -n2 | sed 's/ /:/g')
+
+                    if [[ -z "$phase0_imgs_names_with_tags_to_pull" ]]; then
+                        phase0_imgs_names_with_tags_to_pull="${values_file_imgs}"
+                    else
+                        phase0_imgs_names_with_tags_to_pull="${phase0_imgs_names_with_tags_to_pull}"$'\\n'"${values_file_imgs}"
+                    fi
+                done
+
+                #filter duplicate image:tag
+                phase0_imgs_names_with_tags_to_pull=$(echo "$phase0_imgs_names_with_tags_to_pull" | awk '!seen[$1]++')
+                #remove certain selected images from phase0 images pull
+                phase0_imgs_names_with_tags_to_pull=$(echo "$phase0_imgs_names_with_tags_to_pull" | grep -Ev "eric-enm-init-container:latest")
+                num_phase0_imgs_pull="$(echo "$phase0_imgs_names_with_tags_to_pull" | wc -l)"
+                echo "number of phase0 images to pull: $num_phase0_imgs_pull"
+                echo ""
+                echo "Duplicates filtered phase0 images to pull:"
+                echo "$phase0_imgs_names_with_tags_to_pull"
+                echo ""
+
+                #exclude PHASE0_IMAGES_TO_PULL from PHASE1_IMAGES_NAMES_TO_PULL, to not have duplicate pull in phase0 and phase1
+                stateless_integration_charts_of_phase1_imgs_pull=$(ls ${STATELESS_INTEGRATION_PATH} | grep eric | grep -Ev $(sed s"/ /|/g" <<< ${PHASE0_IMAGES_TO_PULL}))
+
+                #add INFRA_INTEGRATION_AS_PHASE1_IMAGES to PHASE1_IMAGES_NAMES_TO_PULL
+                # because few images under infra-integration need to be pulled as phase1 images
+                infra_integration_charts_for_phase1_imgs_pull=$(ls ${INFRA_INTEGRATION_PATH} | grep eric | grep -E $(sed s"/ /|/g" <<< ${INFRA_INTEGRATION_AS_PHASE1_IMAGES}))
+
+                charts_fullnames_of_phase1_imgs_pull="${stateless_integration_charts_of_phase1_imgs_pull}"$'\\n'"${infra_integration_charts_for_phase1_imgs_pull}"
+                #echo "number of total phase1 image: $(echo "${charts_fullnames_of_phase1_imgs_pull}" | wc -l)"
+
+                echo "Step 4. find charts paths of phase1 pullable images."
+                charts_paths_of_phase1_imgs_to_pull=""
+                for chart_fullname_of_phase1_img_pull in ${charts_fullnames_of_phase1_imgs_pull}; do
+
+                    chart_path=$(find enm-integration -type d | grep -w ${chart_fullname_of_phase1_img_pull} | grep -Ev "templates|appconfig")
+
+                    # at the beginning of the loop, charts_paths_of_phase1_imgs_to_pull variable is still empty, so to avoid having an empty line followed by values
+                    if [[ -z "$charts_paths_of_phase1_imgs_to_pull" ]]; then
+                        charts_paths_of_phase1_imgs_to_pull="${chart_path}"
+                    else
+                        charts_paths_of_phase1_imgs_to_pull="${charts_paths_of_phase1_imgs_to_pull}"$'\\n'"${chart_path}"
+                    fi
+                done
+                echo ""
+
+
+                echo "Step 5. prepare all phase1 images to pull, by reading names and tags from charts."
+                phase1_imgs_names_with_tags_to_pull=""
+                for chart_path in ${charts_paths_of_phase1_imgs_to_pull}; do
+                    values_file="$chart_path/values.yaml"
+                    values_file_imgs=$(sed -n '/images/,/imageCredentials/p' ${values_file} | grep -E "name: eric|tag" | sed 's/name: //g' | sed 's/tag: //g' | awk '{$1=$1};1' | xargs -n2 -d'\\n' | sed 's/ /:/g')
+
+                    if [[ -z "$phase1_imgs_names_with_tags_to_pull" ]]; then
+                        phase1_imgs_names_with_tags_to_pull="${values_file_imgs}"
+                    else
+                        phase1_imgs_names_with_tags_to_pull="${phase1_imgs_names_with_tags_to_pull}"$'\\n'"${values_file_imgs}"
+                    fi
+                done
+
+                #filter duplicate image:tag
+                phase1_imgs_names_with_tags_to_pull=$(echo "$phase1_imgs_names_with_tags_to_pull" | awk '!seen[$1]++')
+                num_phase1_imgs_pull="$(echo "$phase1_imgs_names_with_tags_to_pull" | wc -l)"
+                echo "number of phase1 images to pull: $num_phase1_imgs_pull"
+                echo ""
+                echo "Duplicates filtered phase1 images to pull:"
+                echo "$phase1_imgs_names_with_tags_to_pull"
+                echo ""
+
+                echo "Step 6. prepare ECR registries on AWS for phase0 and phase1 images"
+
+                REGISTRIES_ON_ECR=$(aws ecr describe-repositories | grep repositoryName | awk '{print $2}' | tr -d '",')
+
+                fullname_phase0_images_to_pull=$(echo "$phase0_imgs_names_with_tags_to_pull" | cut -d ":" -f1)
+                fullname_phase1_images_to_pull=$(echo "$phase1_imgs_names_with_tags_to_pull" | cut -d ":" -f1)
+
+                # any registry (whether phase 0 or 1) that needs to be created on ECR
+                ECR_REGISTRIES_TO_CHECK="${fullname_phase0_images_to_build} ${fullname_phase0_images_to_pull} ${fullname_phase1_images_to_pull}"
+
+                for ecr_registry_to_check in ${ECR_REGISTRIES_TO_CHECK}; do
+                    registry_name="enm/$ecr_registry_to_check"
+
+                    grep -q ${registry_name} <<< "$REGISTRIES_ON_ECR"
+
+                    if [[ $? -eq 0 ]]; then
+                        echo "repository ${registry_name} already exists on ECR."
+                    else
+                        echo "$registry_name does not exist on ECR, creating it."
+                        aws ecr create-repository --repository-name ${registry_name}
+                        if [[ ! $? == 0 ]] ; then
+                            echo "Failed to create $registry_name on ECR."
+                            exit 1
+                        fi
+
+                        echo "applying lifecycle policy for $registry_name"
+                        aws ecr put-lifecycle-policy --repository-name "${registry_name}" --lifecycle-policy-text file://ecr_registry_lifecycle_policy.json
+                         if [[ ! $? == 0 ]] ; then
+                            echo "Failed to assign lifecycle policy on ECR for $registry_name"
+                            exit 1
+                        fi
+
+                        echo "Successfully created $registry_name on ECR."
+                    fi
+                done
+                echo ""
+
+
+
+                echo "Step 7. make necessary modifications and fixes before building phase0 image."
+
+                echo "Step 7.1 modify cifwk_enm and rhel yum repos to point to cloud front domain."
+
+                all_rhel6base_repos="$OSS_PHASE0_PATH/eric-enm-rhel6base/image_content/yum.repos.d/*.repo"
+                rhel_repo_path="$OSS_PHASE0_PATH/eric-enm-rhel6base/image_content/yum.repos.d/rhel.repo"
+                cifwk_enm_repo_path="$OSS_PHASE0_PATH/eric-enm-rhel6base/image_content/yum.repos.d/cifwk_enm.repo"
+
+                echo "Step 7.2 remove /latest from all rhel6base repos"
+                sed -i s"/\\/latest//g" ${all_rhel6base_repos}
+
+                echo "Step 7.3 change staticRepos link to cloud front domain on rhel.repo to for rhel6base."
+                sed -i s"/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/RHEL6.10_OS_Patch_Set/${CLOUD_FRONT_DOMAIN}\\/RHEL\\/RHEL6-$RHEL_VERSION/g" ${rhel_repo_path}
+
+                echo "Step 7.4 change staticRepos link to cloud front domain on cifwk_enm.repo to for rhel6base."
+                sed -i s"/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos/${CLOUD_FRONT_DOMAIN}/g" ${cifwk_enm_repo_path}
+
+                echo "Step 7.5 show contents"
+                for repo_file in $(ls ${all_rhel6base_repos} -1);
+                    do echo ""
+                    echo "$repo_file contents:"
+                    cat ${repo_file}
+                    echo ""
+                done
+                echo ""
+
+                echo "Step 7.6 inject manually downloaded dependencies to rhel6base Dockerfile "
+                # Modify Dockerfile to refer to a local package instead of remote repo as follows:
+                # 1. Download desired package to image_content folder
+                # 2. Modify Dockerfile commands to copy the package to /var/tmp inside the docker image
+                # 3. Modify package installation command to use the rpm from /var/tmp
+                # Note: Packages should be mapped in MANUAL_DEP_MAP to get the URL
+
+                ES_URL="https://arm101-eiffel004.lmera.ericsson.se:8443/nexus/content/repositories/litp_releases/com/ericsson/nms/litp/3pps/EXTRlitprsyslogelasticsearch_CXP9032173"
+                declare -A MANUAL_DEP_MAP=( ["EXTRlitprsyslogelasticsearch_CXP9032173"]="${ES_URL}" )
+
+                ES_dependency="EXTRlitprsyslogelasticsearch_CXP9032173"
+                ES_dependency_version="1.1.5"
+                ES_rpm_file="${ES_dependency}-${ES_dependency_version}.rpm"
+
+                pkg_url="${MANUAL_DEP_MAP[${ES_dependency}]}"
+
+                enm_rhel6base_download_dest="$OSS_PHASE0_PATH/eric-enm-rhel6base/image_content"
+                echo "Step 7.7 Download elastic search dependency to $enm_rhel6base_download_dest"
+                wget -P ${enm_rhel6base_download_dest} "${pkg_url}/${ES_dependency_version}/${ES_rpm_file}" || exit $?
+                echo ""
+
+                enm_rhel6base_dockerfile="$OSS_PHASE0_PATH/eric-enm-rhel6base/Dockerfile"
+
+                echo "Step 7.8 modify the install command to install the dependency using the rpm under /var/tmp/"
+                sed -i s"/${ES_dependency}/\\/var\\/tmp\\/${ES_rpm_file}/g" ${enm_rhel6base_dockerfile}
+                echo ""
+
+                echo "Step 7.9 add a copy command to copy the downloaded dependency from image_content to /var/tmp/"
+                sed -i -e "/MAINTAINER dudderlads/a \\\\\\nCOPY image_content/${ES_rpm_file} /var/tmp/" ${enm_rhel6base_dockerfile}
+                echo ""
+
+
+
+                echo "Step 7.10 change armdocker link to ECR for phase0 docker files"
+
+                for phase0_image_name_to_build in ${fullname_phase0_images_to_build}; do
+                    echo "Trying to change armdocker link to ECR for $phase0_image_name_to_build"
+                    sed -i s"/armdocker.rnd.ericsson.se\\/proj_oss_releases/${ECR_LINK}/g" "$OSS_PHASE0_PATH/$phase0_image_name_to_build/Dockerfile"
+                    echo ""
+                done
+
+                echo "Number of phase0 docker files that might have armdocker link changed to ECR: $(echo "$fullname_phase0_images_to_build" | wc -l)"
+                echo ""
+
+                # TODO Ask Sajeesh to request this change to be done if possible
+                echo "Step 7.11 Modify neo4j's Dockerfile to copy postgres_key.pem from image_content dir"
+                sed -i s"/COPY postgres_key.pem/COPY image_content\\/postgres_key.pem/g" "$OSS_PHASE0_PATH/eric-enmsg-neo4j/Dockerfile"
+                echo ""
+
+                echo  "Step 7.12 modify opendj_config.sh"
+                OPENDJ_CONFIG_SCRIPT="$OSS_PHASE0_PATH/eric-enmsg-opendj/image_content/opendj_config.sh"
+                REMOVE_CMD="rm -rf /etc/security/limits.d/opendj_custom.conf"
+                sed -i -e "/#aws fixes/a $REMOVE_CMD" ${OPENDJ_CONFIG_SCRIPT}
+                echo ""
+
+
+
+                echo "Step 8. build selected phase0 images and push to ECR"
+                num_phase0_built_imgs=0
+                for phase0_image_name_to_build in ${fullname_phase0_images_to_build}; do
+
+                    build_tagged_phase0_img="$ECR_LINK/enm/$phase0_image_name_to_build:$BUILD_ID"
+                    echo "Build $phase0_image_name_to_build image with $build_tagged_phase0_img tag"
+                    docker build -t ${build_tagged_phase0_img} "$OSS_PHASE0_PATH/$phase0_image_name_to_build/" || exit $?
+                    echo ""
+
+                    echo "Tag the built $phase0_image_name_to_build image as latest"
+                    latest_tagged_phase0_img="$ECR_LINK/enm/$phase0_image_name_to_build:latest"
+                    docker tag ${build_tagged_phase0_img} ${latest_tagged_phase0_img}
+                    echo ""
+
+                    echo "Pushing $build_tagged_phase0_img and $latest_tagged_phase0_img to ECR:"
+                    docker push ${build_tagged_phase0_img} || exit $?
+                    docker push ${latest_tagged_phase0_img} || exit $?
+                    echo ""
+
+                    #echo "Cleanup $phase0_repo images"
+                    docker rmi ${build_tagged_phase0_img}
+                    docker rmi ${latest_tagged_phase0_img}
+                    num_phase0_built_imgs=$((num_phase0_built_imgs+1))
+                    echo "==========# $num_phase0_built_imgs out of $num_phase0_images_to_build phase0 build, tag, and push to ecr #=========="
+                    echo ""
+                done
+
+                # The previous loop leaves an image, but better not to remove it for cashing purposes
+                # docker rmi registry.access.redhat.com/rhel6/rhel:6.10
+
+                echo ""
+
+
+                echo "Step 9. pull, modify, commit, tag and push phase0 images to ECR."
+                num_phase0_pulled_imgs=0
+                for phase0_img_name_with_tag in ${phase0_imgs_names_with_tags_to_pull}; do
+
+                    phase0_image_name=$(echo "$phase0_img_name_with_tag"| cut -d ":" -f1)
+                    phase0_image_tag=$(echo "$phase0_img_name_with_tag"| cut -d ":" -f2)
+                    echo "The tag for $phase0_image_name is: $phase0_image_tag"
+
+                    echo "Pull $phase0_img_name_with_tag from $ARM_PROJ_OSS_RELEASES"
+                    pull_source="$ARM_PROJ_OSS_RELEASES"
+                    docker pull ${ARM_PROJ_OSS_RELEASES}/${phase0_img_name_with_tag}
+
+                    if [[ $? != 0 ]]; then
+                        echo "pulling $phase0_img_name_with_tag from $ARM_PROJ_OSS_RELEASES failed, will try to pull from $ARM_PROJ_ENM"
+                        pull_source="$ARM_PROJ_ENM"
+                        echo ""
+
+                        docker pull ${ARM_PROJ_ENM}/${phase0_img_name_with_tag}
+                        if [[ $? != 0 ]]; then
+                            echo "pulling $phase0_img_name_with_tag from $ARM_PROJ_ENM failed"
+                        fi
+                    fi
+
+                    echo ""
+
+                    container_name="${phase0_image_name}_container_$BUILD_ID"
+
+                    docker run -d -it --name ${container_name} ${pull_source}/${phase0_img_name_with_tag} bash
+                    echo ""
+
+                    echo "Modify rhel.repo for $phase0_image_name"
+
+                    if [[ ${phase0_image_name} =~ ^(eric-enmsg-modelserv|eric-enmsg-httpd)$ ]]; then
+                        docker exec ${container_name} sed -i \\
+                        s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/RHEL6.10_OS_Patch_Set\\/latest/$CLOUD_FRONT_LINK/g" \\
+                        /etc/yum.repos.d/rhel.repo
+                    else
+                        docker exec ${container_name} sed -i \\
+                        s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/RHEL6.10_OS_Patch_Set\\/latest/$CLOUD_FRONT_LINK\\/RHEL\\/RHEL6-$RHEL_VERSION/g" \\
+                        /etc/yum.repos.d/rhel.repo
+                    fi
+
+                    echo "$phase0_image_name rhel.repo contents:"
+                    docker exec ${container_name} cat /etc/yum.repos.d/rhel.repo
+                    echo ""
+
+                    echo "Modify cifwk_enm.repo for $phase0_image_name"
+                    docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/ENM\\/latest/$CLOUD_FRONT_LINK\\/ENM/g" \\
+                    /etc/yum.repos.d/cifwk_enm.repo
+                    echo "$phase0_image_name cifwk_enm.repo contents:"
+                    docker exec ${container_name} cat /etc/yum.repos.d/cifwk_enm.repo
+                    echo ""
+
+                    phase0_image_name_ecr="$ECR_LINK/enm/$phase0_img_name_with_tag"
+                    docker commit ${container_name} ${phase0_image_name_ecr}
+                    echo ""
+
+                    echo "Stop and remove $container_name"
+                    docker stop ${container_name}
+                    docker rm ${container_name}
+                    echo ""
+
+                    echo "Push $phase0_image_name_ecr to ECR"
+                    docker push ${phase0_image_name_ecr}
+                    echo ""
+
+                    #echo "Cleanup $phase0_image_name images"
+                    docker rmi ${pull_source}/${phase0_img_name_with_tag}
+                    docker rmi ${phase0_image_name_ecr}
+                    num_phase0_pulled_imgs=$((num_phase0_pulled_imgs+1))
+                    echo "==========# $num_phase0_pulled_imgs out of $num_phase0_imgs_pull phase0 image pull, modify, commit, tag and push to ecr #=========="
+                    echo ""
+                done
+
+
+                echo "Step 10. pull, tag and push phase1 images to ECR."
+                num_phase1_pulled_imgs=0
+                for phase1_img_name_with_tag in ${phase1_imgs_names_with_tags_to_pull}; do
+
+                    phase1_image_name=$(echo "$phase1_img_name_with_tag"| cut -d ":" -f1)
+                    phase1_image_tag=$(echo "$phase1_img_name_with_tag"| cut -d ":" -f2)
+                    echo "The tag for $phase1_image_name is: $phase1_image_tag"
+
+                    echo "Pull $phase1_img_name_with_tag from $ARM_PROJ_OSS_RELEASES"
+                    pull_source="$ARM_PROJ_OSS_RELEASES"
+                    docker pull ${ARM_PROJ_OSS_RELEASES}/${phase1_img_name_with_tag}
+
+                    if [[ $? != 0 ]]; then
+                        echo "pulling $phase1_img_name_with_tag from $ARM_PROJ_OSS_RELEASES failed, will try to pull from $ARM_PROJ_ENM"
+                        pull_source="$ARM_PROJ_ENM"
+                        echo ""
+
+                        docker pull ${ARM_PROJ_ENM}/${phase1_img_name_with_tag}
+                        if [[ $? != 0 ]]; then
+                            echo "pulling $phase1_img_name_with_tag from $ARM_PROJ_ENM failed"
+                            echo ""
+                        fi
+                    fi
+
+                    echo ""
+
+                    phase1_image_name_ecr="$ECR_LINK/enm/$phase1_img_name_with_tag"
+                    echo "Tag $phase1_img_name_with_tag with $phase1_image_name_ecr"
+                    docker tag ${pull_source}/${phase1_img_name_with_tag} ${phase1_image_name_ecr}
+                    echo ""
+
+                    echo "Push $phase1_image_name_ecr to ECR"
+                    docker push ${phase1_image_name_ecr}
+                    echo ""
+
+                    #echo "Cleanup $phase1_image_name images"
+                    docker rmi ${pull_source}/${phase1_img_name_with_tag}
+                    docker rmi ${phase1_image_name_ecr}
+                    num_phase1_pulled_imgs=$((num_phase1_pulled_imgs+1))
+                    echo "==========# $num_phase1_pulled_imgs out of $num_phase1_imgs_pull phase1 image pull, tag and push to ecr #=========="
+                    echo ""
+                done
+
+                echo ""
+
+
+
+
+                echo "Step 11. pull, tag and push eric-enm-neo4j-server-extension to ECR."
+
+                docker pull armdocker.rnd.ericsson.se/proj_oss_releases/enm/eric-enm-neo4j-server-extension
+
+                echo "Modify yum repos for neo4j-server-extension."
+                container_name="neo4j-server-extension_container_$BUILD_ID"
+                docker run -d -it --name ${container_name} armdocker.rnd.ericsson.se/proj_oss_releases/enm/eric-enm-neo4j-server-extension:latest bash
+                echo ""
+
+                echo "Modify rhel.repo for neo4j-server-extension."
+                docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/RHEL6.10_OS_Patch_Set\\/latest/$CLOUD_FRONT_LINK\\/RHEL/g" \\
+                /etc/yum.repos.d/rhel.repo
+                echo ""
+
+                echo "Modify cifwk_enm.repo for neo4j-server-extension."
+                docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/ENM\\/latest/$CLOUD_FRONT_LINK\\/ENM/g" \\
+                /etc/yum.repos.d/cifwk_enm.repo
+                echo ""
+
+                docker commit ${container_name} ${ECR_LINK}/enm/eric-enm-neo4j-server-extension:latest
+                echo ""
+
+                echo "Show contents."
+                docker run --rm ${ECR_LINK}/enm/eric-enm-neo4j-server-extension:latest cat /etc/yum.repos.d/rhel.repo
+                docker run --rm ${ECR_LINK}/enm/eric-enm-neo4j-server-extension:latest cat /etc/yum.repos.d/cifwk_enm.repo
+                echo ""
+
+                docker push ${ECR_LINK}/enm/eric-enm-neo4j-server-extension:latest
+                echo ""
+
+                echo "Stop and remove the container."
+                docker stop ${container_name}
+                docker rm ${container_name}
+                echo ""
+
+                #echo "Cleanup eric-enm-neo4j-server-extension image."
+                docker rmi armdocker.rnd.ericsson.se/proj_oss_releases/enm/eric-enm-neo4j-server-extension:latest
+                docker rmi ${ECR_LINK}/enm/eric-enm-neo4j-server-extension:latest
+
+                echo ""
+                echo "Docker build, pull and push script has finished successfully."
+                echo ""
+                '''
+            }
+        }
+        stage('modelserv:latest image modifications') {
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'nemesis_functional_id', usernameVariable: 'ARMDOCKER_REPO_USER', passwordVariable: 'ARMDOCKER_PASSWORD']]) {
+                    sh '''
+                    docker login armdocker.rnd.ericsson.se --username $ARMDOCKER_REPO_USER --password $ARMDOCKER_PASSWORD
+                    '''
+                }
+				sh '''#!/bin/bash
+                # no need to clone for now, since that modelserv build will fail
+                # pull enm-integration gerrit repos
+
+				#git clone ssh://$GERRIT_USER@gerrit.ericsson.se:29418/OSS/com.ericsson.oss.containerisation/eric-enmsg-modelserv
+
+				#echo "### Change image pull from armdocker to ECR for modelserv Dockerfile ###"
+                #sed -i s"/armdocker.rnd.ericsson.se\\\\/proj_oss_releases/$ECR_LINK/g" eric-enmsg-modelserv/Dockerfile
+
+				# currently build will fail, for now pull from armdocker, tag and push to ECR instead.
+                #echo "### Build modelserv image ###"
+                #modelserv_test_tag="$ECR_LINK/enm/eric-enmsg-modelserv:test"
+				#docker build -t $modelserv_test_tag eric-enmsg-modelserv/
+
+				#echo "### Push modelserv image to ECR ###"
+                #docker push $modelserv_test_tag
+
+				#echo "### Clean modelserv image ###"
+                docker rmi $modelserv_test_tag
+
+				# temporary, untill modelserv build is ok
+                echo "### Separately pull eric-enmsg-modelserv:latest from proj-enm ###"
+                docker pull armdocker.rnd.ericsson.se/proj-enm/eric-enmsg-modelserv
+                echo ""
+
+                CLOUD_FRONT_LINK="baseurl=http\\\\:\\\\/\\\\/$CLOUD_FRONT_DOMAIN"
+                echo "$CLOUD_FRONT_LINK"
+
+				echo "### Modify rhel.repo and cifwk_enm.repo for eric-enmsg-modelserv:latest image to use cloudfront link to reach S3 ###"
+				container_name="modelserv_container_$BUILD_ID"
+                docker run -d -it --name ${container_name} armdocker.rnd.ericsson.se/proj-enm/eric-enmsg-modelserv:latest
+
+                docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/RHEL6.10_OS_Patch_Set\\/latest/$CLOUD_FRONT_LINK/g" \\
+                /etc/yum.repos.d/rhel.repo
+
+				docker exec ${container_name} sed -i s"/baseurl=https\\:\\/\\/cifwk-oss.lmera.ericsson.se\\/static\\/staticRepos\\/ENM\\/latest/$CLOUD_FRONT_LINK\\/ENM/g" \\
+                /etc/yum.repos.d/cifwk_enm.repo
+
+				echo "Show modifications for rhel and cifwk repos of modelserv_latest_img_container"
+                docker exec ${container_name} cat /etc/yum.repos.d/rhel.repo
+                docker exec ${container_name} cat /etc/yum.repos.d/cifwk_enm.repo
+
+				docker commit ${container_name} $ECR_LINK/enm/eric-enmsg-modelserv:latest
+
+				echo "### Push modelserv:latest to ECR ###"
+                docker push $ECR_LINK/enm/eric-enmsg-modelserv:latest
+
+				echo "### Stop and remove the containers ###"
+                docker stop ${container_name}
+                docker rm ${container_name}
+
+				#echo "### Remove the used and created images ###"
+                docker rmi -f $(docker images | egrep "modelserv" | awk '{print $3}')
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            // the 'always' block executes before the 'cleanup' block, even if it was placed after it
+            archiveArtifacts artifacts: '**/*', defaultExcludes: false
+        }
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        /* clean up our workspace */
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

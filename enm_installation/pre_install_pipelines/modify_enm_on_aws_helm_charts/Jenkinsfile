@@ -1,0 +1,177 @@
+pipeline {
+    agent any
+    options {
+        copyArtifactPermission('perform_enm_on_aws_git_tracking, install_ENM_AWS, smoke_tests_ENM_install, create_AWS_ENM_UI_domain')
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '1', daysToKeepStr: '', numToKeepStr: '5')
+    }
+    parameters {
+        string(name: 'EFS_NAME', defaultValue: 'enm-phase-1-enmaws-efs', description: 'efs  name')
+        string(name: 'REGION', defaultValue: "eu-west-1",description: 'AWS region')
+        string(name: 'ECR_LINK', defaultValue: '152254703525.dkr.ecr.eu-west-1.amazonaws.com', description: 'AWS ECR link')
+
+        string(name: 'ENM_INTEGRATION_YAML_URL', defaultValue: 'https://arm.epk.ericsson.se/artifactory/proj-enm-helm/integration-values/', description: 'Where all the integration values yaml files.')
+        booleanParam(name: 'DOWNLOAD_LATEST_ENM_INTEGRATION_VALUES', defaultValue: false, description: 'Whether to download the latest enm-integration-values.yaml or a certain version')
+        string(name: 'INTEGRATION_VALUES_VERSION', defaultValue: '1.0.80', description: 'Version of the successful integration values file, to download and use with helm install')
+
+        string(name: 'ENM_DOMAIN_NAME', defaultValue: 'ericssonenm.customers.enmaas.io', description: 'Domain for the ENM UI')
+
+        string(name: 'EMAIL_TO', defaultValue: 'PDLNEMESIS@pdl.internal.ericsson.com')
+        string(name: 'GERRIT_USER', defaultValue: 'jnkcinmaas', description: 'Which gerrit user to use when pulling and pushing to and from gerrit.')
+    }
+    stages{
+        stage('Remove any previous builds') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Refresh armdocker login') {
+           steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'nemesis_functional_id', usernameVariable: 'ARMDOCKER_REPO_USER', passwordVariable: 'ARMDOCKER_PASSWORD']]) {
+                    sh '''
+                    docker login armdocker.rnd.ericsson.se --username $ARMDOCKER_REPO_USER --password $ARMDOCKER_PASSWORD
+                    '''
+                }
+            }
+        }
+        stage ('Copy artifacts') {
+            steps {
+                script {
+                    copyArtifacts filter: '*.tgz,enm-integration/**/*', fingerprintArtifacts: true, projectName: 'prepare_enm_on_aws_images', selector: lastWithArtifacts()
+                    sh 'echo "$(ls)"'
+                }
+            }
+        }
+		stage('neo4j chart modifications') {
+			steps {
+				sh '''#!/bin/bash
+				neo4j_values_file="enm-integration/charts/infra-integration/charts/neo4j/values.yaml"
+
+				echo "### Change image pull from armdocker to ECR for neo4j values.yaml ###"
+				sed -i s"/armdocker.rnd.ericsson.se\\/proj_oss_releases/$ECR_LINK/g" $neo4j_values_file
+
+				echo "### Change pull image tag from mistytest to latest for neo4j values.yaml ###"
+				sed -i s"/mistytest/latest/g" $neo4j_values_file
+
+				echo "### Change storage class from erikube-cinder to aws-efs for neo4j values.yaml ###"
+				sed -i s"/erikube-cinder/aws-efs/g" $neo4j_values_file
+				'''
+			}
+		}
+		stage('modelserv chart related modifications') {
+			steps {
+				sh '''#!/bin/bash
+				modelserv_values_file="enm-integration/charts/infra-integration/charts/eric-enmsg-modelserv/values.yaml"
+
+				echo "### Change liveness probe for modelserv values file ###"
+				sed -i s'/initialDelaySeconds\\: 10800/initialDelaySeconds\\: 36000/g' $modelserv_values_file
+
+				echo "### Update size, size2 and size3 for modelserv values file ###"
+				sed -i s'/size\\: 1Gi/size\\: 20Gi/g' $modelserv_values_file
+				sed -i s'/size2\\: 2Gi/size2\\: 20Gi/g' $modelserv_values_file
+				sed -i s'/size3\\: 12Gi/size3\\: 20Gi/g' $modelserv_values_file
+
+				echo "### Update memory for modelserv values file ###"
+				sed -i s'/memory\\: 10Gi/memory\\: 12Gi/g' $modelserv_values_file
+				'''
+			}
+		}
+		stage('Modify links and storage class') {
+			steps {
+				sh '''#!/bin/bash
+				echo "Replace armdocker with ECR link for all files under enm-integration."
+				for i in $(grep -r armdocker.rnd.ericsson.se enm-integration/ | awk '{print $1}' | tr -d :); do sed -i s"/armdocker.rnd.ericsson.se/$ECR_LINK/g" $i; done
+
+				echo "Remove proj_oss_releases enm-integration/ from repo path value for all files under enm-integration."
+				for i in $(grep -r proj_oss_releases/ enm-integration/ | awk '{print $1}' | tr -d :); do sed -i s"/proj_oss_releases\\///g" $i; done
+
+				echo "Replace proj-enm with enm for all files under enm-integration other than requirements.yaml and requirements.lock"
+				for i in $(grep -r proj-enm enm-integration | grep -v requirements | awk '{print $1}' | tr -d :); do sed -i s"/proj-enm/enm/g" $i; done
+
+				echo "Replace erikube-rbd storage class with aws-ebs-gp2 for all files under enm-integration."
+				for i in $(grep -r erikube-rbd enm-integration | awk '{print $1}' | tr -d :); do sed -i s"/erikube-rbd/aws-ebs-gp2/g" $i; done
+
+				echo "Replace gp2 storage class with aws-ebs-gp2 for all files under enm-integration."
+				for i in $(grep -r 'storageClass: "gp2"' enm-integration | awk '{print $1}' | tr -d :); do sed -i s'/storageClass: "gp2"/storageClass: "aws-ebs-gp2"/g' $i; done
+				'''
+			}
+		}
+		stage('Download and modify integration values') {
+			steps {
+				sh '''#!/bin/bash
+				if [ $DOWNLOAD_LATEST_ENM_INTEGRATION_VALUES == "false" ]; then
+                    `wget $ENM_INTEGRATION_YAML_URL\\integration-values-${INTEGRATION_VALUES_VERSION}.yaml`
+
+					integration_values="integration-values-${INTEGRATION_VALUES_VERSION}.yaml"
+                else
+					integration_values=`curl -s $ENM_INTEGRATION_YAML_URL | grep '.yaml' | grep -Ev "sha|md5|enm11|enm41|.gz|integration-values.yaml" | awk -F " " '{print $2,$3,$4}' \\
+					| sort -k 2,2n | grep $(date | awk '{print $2}') | tail -1 | cut -d '"' -f2`
+
+					`wget $ENM_INTEGRATION_YAML_URL\\$integration_values`
+                fi
+
+				cp $integration_values orig_$integration_values
+				mv $integration_values enm-integration/
+
+				integration_values_file="enm-integration/$integration_values"
+				fs_id=$(aws efs describe-file-systems | egrep "Name|FileSystemId" | awk "/$EFS_NAME/,/FileSystemId/" | grep FileSystemId | awk '{print $2}' | tr -d \\",)
+				fs_server="$fs_id.efs.$REGION.amazonaws.com"
+
+				echo "Change registry url from ericsson to ECR."
+				sed -i s"/armdocker.rnd.ericsson.se/$ECR_LINK/g" $integration_values_file
+
+				echo "Add efs id and path."
+				sed -i -e "/pullSecret:/a \\\\\\n  nfs:\\n    server: $fs_server\\n    path: /" $integration_values_file
+
+				echo "Remove the unnecessary nfs provisioner section."
+				perl -i -0pe 's/  #nfs provisioner\\n  nfsprovisioner:\\n    server:\\n    path://g' $integration_values_file
+
+				echo "Fill the StorageClass name field with the value aws-efs."
+				perl -i -0pe 's/  storageClass:\\n    name:/  storageClass:\\n    name: aws-efs/g' $integration_values_file
+
+				echo "Fill the ingress enmHost field with the required value."
+				sed -i s"/enmHost:/enmHost: $ENM_DOMAIN_NAME/g" $integration_values_file
+
+				echo "Fill the nfs storageClass field with the value aws-efs."
+				perl -i -0pe 's/  nfs:\\n    storageClass:/  nfs:\\n    storageClass: aws-efs/g' $integration_values_file
+
+				echo "Disable nfs-client-provisioner from integration values."
+				perl -i -0pe 's/nfs-client-provisioner:\\n  enabled: true/nfs-client-provisioner:\\n  enabled: false/g' $integration_values_file
+
+				echo "Disable eric-enmsg-elasticsearch from integration values."
+				perl -i -0pe 's/eric-enmsg-elasticsearch:\\n  enabled: true/eric-enmsg-elasticsearch:\\n  enabled: false/g' $integration_values_file
+				'''
+			}
+		}
+		stage('Prepare modified enm-integration as a tar') {
+			steps {
+				sh '''#!/bin/bash
+				echo "### Prepare modified enm-integration as a tar to use it with helm install ###"
+				tar czf enm-integration.tgz enm-integration
+				'''
+			}
+		}
+    }
+
+    post {
+        always {
+            // the 'always' block executes before the 'cleanup' block, even if it was placed after it
+            archiveArtifacts artifacts: '**/*', defaultExcludes: false
+        }
+        cleanup {
+            /* clean up tmp directory */
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            /* clean up script directory */
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        /* clean up our workspace */
+        changed {
+            emailext body: '''$DEFAULT_CONTENT''',
+            to: '$EMAIL_TO',
+            subject: '$DEFAULT_SUBJECT'
+        }
+    }
+}

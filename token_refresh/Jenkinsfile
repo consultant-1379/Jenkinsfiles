@@ -1,0 +1,25 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'PROVIDER', defaultValue: 'aws', description: 'Cloud provider name')
+    }
+
+    stages {
+        stage('Token refresh') {
+            steps {
+                script {
+                    switch(PROVIDER) {
+                        case "aws":
+                            token = sh (script: "aws ecr get-login --no-include-email", returnStdout: true ).trim()
+                            sh (script: "${token}", returnStdout: true)
+                            break
+                        case "azure":
+                            echo "Azure yet to be configured"
+                            break
+                    }
+                }
+            }
+        }
+    }
+}
